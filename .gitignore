@@ -1,0 +1,23 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Model weights (large; downloaded via scripts/download_weights.py)
+weights/
+
+# Profiling traces / large artifacts
+*.json.gz
+*.pt.trace.json
+traces/
+bench/results/engine_trace.json
+
+# Keep plots tracked, but ignore scratch
+plots/scratch/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

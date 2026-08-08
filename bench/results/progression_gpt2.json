@@ -1,0 +1,35 @@
+{
+  "model": "gpt2",
+  "prompt_len": 64,
+  "new_tokens": 128,
+  "rows": [
+    {
+      "phase": "1 naive (no cache)",
+      "tok_s": 145.392144873014,
+      "peak_mib": 74.72607421875,
+      "mode": "single-stream",
+      "speedup_vs_naive": 1.0
+    },
+    {
+      "phase": "2 + KV cache",
+      "tok_s": 207.2999892848402,
+      "peak_mib": 27.31298828125,
+      "mode": "single-stream",
+      "speedup_vs_naive": 1.4257990998474968
+    },
+    {
+      "phase": "3 + static batch x16",
+      "tok_s": 2724.862319646061,
+      "peak_mib": 421.34814453125,
+      "mode": "aggregate",
+      "speedup_vs_naive": 18.74146861253038
+    },
+    {
+      "phase": "4 + continuous batch",
+      "tok_s": 1835.7219787159609,
+      "peak_mib": 234.6650390625,
+      "mode": "aggregate (uniform; +1.24x on variable load)",
+      "speedup_vs_naive": 12.62600521038662
+    }
+  ]
+}

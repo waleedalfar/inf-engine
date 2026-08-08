@@ -1,0 +1,75 @@
+{
+  "model": "gpt2",
+  "device": "cuda",
+  "prompt_len": 128,
+  "new_tokens": 128,
+  "seq_total": 256,
+  "weights_mib": 522.7001953125,
+  "total_vram_gib": 15.92047119140625,
+  "kv_bytes_per_seq_at_seq256": 18874368,
+  "kv_bytes_per_seq_at_seq1024": 75497472,
+  "derived_max_batch_seq256": 819,
+  "derived_max_batch_seq1024": 204,
+  "rows": [
+    {
+      "batch": 1,
+      "time_s": 0.8700029253959656,
+      "time_std_s": 0.016261061653494835,
+      "throughput_tok_s": 147.1259420670835,
+      "latency_ms_per_step": 6.796897854655981,
+      "peak_mem_mib": 43.6689453125,
+      "util_mean": 57.272727966308594,
+      "util_max": 58.0
+    },
+    {
+      "batch": 2,
+      "time_s": 0.8747110366821289,
+      "time_std_s": 0.023024190217256546,
+      "throughput_tok_s": 292.66808038805016,
+      "latency_ms_per_step": 6.833679974079132,
+      "peak_mem_mib": 88.25830078125,
+      "util_mean": 58.33333206176758,
+      "util_max": 60.0
+    },
+    {
+      "batch": 4,
+      "time_s": 0.8962308168411255,
+      "time_std_s": 0.018524231389164925,
+      "throughput_tok_s": 571.2814047218397,
+      "latency_ms_per_step": 7.001803256571293,
+      "peak_mem_mib": 176.17431640625,
+      "util_mean": 58.769229888916016,
+      "util_max": 62.0
+    },
+    {
+      "batch": 8,
+      "time_s": 0.923089325428009,
+      "time_std_s": 0.014244581572711468,
+      "throughput_tok_s": 1109.3184286636633,
+      "latency_ms_per_step": 7.211635354906321,
+      "peak_mem_mib": 349.34814453125,
+      "util_mean": 59.83333206176758,
+      "util_max": 62.0
+    },
+    {
+      "batch": 16,
+      "time_s": 0.9778671264648438,
+      "time_std_s": 0.01169226597994566,
+      "throughput_tok_s": 2094.3540738544602,
+      "latency_ms_per_step": 7.639586925506592,
+      "peak_mem_mib": 698.69580078125,
+      "util_mean": 62.61538314819336,
+      "util_max": 66.0
+    },
+    {
+      "batch": 32,
+      "time_s": 1.1049635410308838,
+      "time_std_s": 0.010929293930530548,
+      "throughput_tok_s": 3706.9096381031786,
+      "latency_ms_per_step": 8.63252766430378,
+      "peak_mem_mib": 1398.12548828125,
+      "util_mean": 66.30000305175781,
+      "util_max": 76.0
+    }
+  ]
+}

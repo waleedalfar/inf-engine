@@ -1,0 +1,18 @@
+# Engine runtime deps (imported by engine/)
+# torch is installed separately with the CUDA (sm_120 / Blackwell) wheel:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+safetensors
+tiktoken
+numpy
+
+# Phase 5 kernels
+# triton (installed with torch on Linux; pinned here for clarity)
+
+# Plotting / benchmarking
+matplotlib
+
+# Dev / test ONLY — transformers is used solely as the correctness oracle in tests/
+# and is never imported by the engine/ package.
+transformers
+pytest
+huggingface_hub

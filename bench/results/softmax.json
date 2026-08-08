@@ -1,0 +1,54 @@
+{
+  "peak_bw_gb_s": 896.064,
+  "l2_bytes": 50331648,
+  "rows": [
+    {
+      "n_rows": 8192,
+      "n_cols": 512,
+      "l2_resident": true,
+      "triton_us": 17.24735975265503,
+      "torch_us": 14.958720207214355,
+      "triton_gbps": 1945.4822350322163,
+      "torch_gbps": 2243.135210445157,
+      "triton_pct_peak": 217.1142055737332,
+      "torch_pct_peak": 250.33203102068126,
+      "speedup": 0.8673049337253856
+    },
+    {
+      "n_rows": 8192,
+      "n_cols": 1024,
+      "l2_resident": false,
+      "triton_us": 73.97568225860596,
+      "torch_us": 82.32192039489745,
+      "triton_gbps": 907.1746545763408,
+      "torch_gbps": 815.2004190145157,
+      "triton_pct_peak": 101.23993984540623,
+      "torch_pct_peak": 90.97569135848731,
+      "speedup": 1.112824077878924
+    },
+    {
+      "n_rows": 8192,
+      "n_cols": 2048,
+      "l2_resident": false,
+      "triton_us": 193.88416290283203,
+      "torch_us": 193.50400924682617,
+      "triton_gbps": 692.2573045188082,
+      "torch_gbps": 693.6172977625342,
+      "triton_pct_peak": 77.25534164064264,
+      "torch_pct_peak": 77.40711575987143,
+      "speedup": 0.9980392743258955
+    },
+    {
+      "n_rows": 8192,
+      "n_cols": 4096,
+      "l2_resident": false,
+      "triton_us": 402.7872085571289,
+      "torch_us": 389.3132781982422,
+      "triton_gbps": 666.4448381109072,
+      "torch_gbps": 689.5101478231884,
+      "triton_pct_peak": 74.3746917754655,
+      "torch_pct_peak": 76.94876122946447,
+      "speedup": 0.9665482664974558
+    }
+  ]
+}

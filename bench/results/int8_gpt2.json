@@ -1,0 +1,18 @@
+{
+  "model": "gpt2",
+  "tokens": 138,
+  "ppl_fp32": 62.54758834838867,
+  "ppl_int8": 62.73807144165039,
+  "ppl_delta_pct": 0.3045410675160362,
+  "linear_fp32_mib": 324.0,
+  "linear_int8_mib": 81.31640625,
+  "weight_mem_reduction": 3.9844357976653697,
+  "gemm_shape": [
+    16,
+    768,
+    2304
+  ],
+  "int8_matmul_us": 57.740159034729004,
+  "torch_fp16_us": 8.38912010192871,
+  "matmul_speedup": 0.14529090744074502
+}

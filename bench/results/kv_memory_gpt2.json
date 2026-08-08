@@ -1,0 +1,30 @@
+{
+  "model": "gpt2",
+  "device": "cuda",
+  "rows": [
+    {
+      "seq_len": 128,
+      "theoretical_kv_bytes": 9437184,
+      "static_peak_bytes": 18370560,
+      "dynamic_peak_bytes": 9975296
+    },
+    {
+      "seq_len": 512,
+      "theoretical_kv_bytes": 37748736,
+      "static_peak_bytes": 38165504,
+      "dynamic_peak_bytes": 48402944
+    },
+    {
+      "seq_len": 1024,
+      "theoretical_kv_bytes": 75497472,
+      "static_peak_bytes": 75918336,
+      "dynamic_peak_bytes": 78795264
+    },
+    {
+      "seq_len": 2048,
+      "theoretical_kv_bytes": 150994944,
+      "static_peak_bytes": 151459840,
+      "dynamic_peak_bytes": 157446656
+    }
+  ]
+}

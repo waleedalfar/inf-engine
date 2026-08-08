@@ -1,0 +1,51 @@
+{
+  "B": 2,
+  "H": 8,
+  "D": 64,
+  "rows": [
+    {
+      "seq": 512,
+      "flash_peak_mib": 2.0,
+      "naive_peak_mib": 42.375,
+      "flash_ms": 0.1884927988052368,
+      "naive_ms": 0.14393279552459717,
+      "flash_tflops": 5.696460717894379,
+      "naive_tflops": 7.460022019905147,
+      "mem_ratio": 21.1875,
+      "speedup": 0.763598378489345
+    },
+    {
+      "seq": 1024,
+      "flash_peak_mib": 4.0,
+      "naive_peak_mib": 133.0,
+      "flash_ms": 0.5646512031555175,
+      "naive_ms": 0.9761743545532227,
+      "flash_tflops": 7.606407764648064,
+      "naive_tflops": 4.399795257851994,
+      "mem_ratio": 33.25,
+      "speedup": 1.7288094829125202
+    },
+    {
+      "seq": 2048,
+      "flash_peak_mib": 8.0,
+      "naive_peak_mib": 524.0,
+      "flash_ms": 1.873886489868164,
+      "naive_ms": 3.8951759338378906,
+      "flash_tflops": 9.16804154194456,
+      "naive_tflops": 4.41055024877215,
+      "mem_ratio": 65.5,
+      "speedup": 2.0786616237955444
+    },
+    {
+      "seq": 4096,
+      "flash_peak_mib": 16.0,
+      "naive_peak_mib": 2080.0,
+      "flash_ms": 6.783475494384765,
+      "naive_ms": 15.863856506347654,
+      "flash_tflops": 10.130423083695769,
+      "naive_tflops": 4.331826672064454,
+      "mem_ratio": 130.0,
+      "speedup": 2.3386030537708082
+    }
+  ]
+}
