@@ -1,7 +1,5 @@
 # Architecture
 
-A new engineer should be able to understand the full system from this document before reading code.
-
 ---
 
 ## Overview
