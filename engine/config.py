@@ -232,18 +232,20 @@ QWEN3_32B = LlamaConfig(
 )
 
 # Qwen3-30B-A3B: 30B total parameters, ~3B active per token.
-# Dimensions are estimates; verify from the model's config.json before loading real weights:
-#   hidden_size, num_hidden_layers, num_attention_heads, num_key_value_heads,
-#   num_experts, num_experts_per_tok, moe_intermediate_size, shared_expert_intermediate_size.
+# Verified against weights/Qwen--Qwen3-30B-A3B/config.json:
+#   q_proj.weight (4096, 2048) → n_head=32, head_dim=128
+#   k_proj.weight (512,  2048) → n_kv_heads=4, head_dim=128
+#   experts.0.gate_proj.weight (768, 2048) → moe_intermediate_size=768
+#   NO shared expert in this model — pure top-K routing only.
 QWEN3_30B_A3B = LlamaConfig(
     name="Qwen/Qwen3-30B-A3B",
     vocab_size=151_936,
-    n_ctx=32_768,
+    n_ctx=40_960,
     d_model=2048,
     n_layer=48,
-    n_head=16,
-    n_kv_heads=8,
-    intermediate_size=768,       # placeholder — unused when is_moe=True
+    n_head=32,
+    n_kv_heads=4,
+    intermediate_size=6144,      # dense FFN size from config.json (unused — is_moe=True)
     rope_theta=1_000_000.0,
     norm_eps=1e-6,
     qk_norm=True,
@@ -251,7 +253,7 @@ QWEN3_30B_A3B = LlamaConfig(
     n_experts=128,
     n_experts_per_tok=8,
     moe_intermediate_size=768,
-    shared_expert_intermediate_size=768,
+    shared_expert_intermediate_size=0,  # no shared expert in Qwen3-30B-A3B
 )
 
 LLAMA_CONFIGS: dict[str, LlamaConfig] = {
