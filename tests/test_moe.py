@@ -482,20 +482,21 @@ def test_moe_int4_quant_output_close_to_fp32():
     from engine.llama_weights import LlamaWeights
     from engine.llama_model import LlamaModel
     from engine.quantize import quantize_llama
-    from engine.sampling import SamplingConfig, SamplingMode
 
     config = _mini_moe_config(n_experts=4, moe_inter=32, shared_inter=32)
+    ids = torch.randint(0, config.vocab_size, (1, 3))
+
+    # fp32 forward must happen before quantize_llama, which pops bf16 tensors
+    # from the shared weights dict to reclaim VRAM.
     tensors = _make_tensors(config, device="cpu", seed=99)
     weights = LlamaWeights(tensors, config)
     model = LlamaModel(weights, config)
-    q_model = quantize_llama(model, group_size=16)
-
-    greedy = SamplingConfig(mode=SamplingMode.GREEDY)
-    ids = torch.randint(0, config.vocab_size, (1, 3))
-
     with torch.no_grad():
         logits_fp = model.forward(ids, start_pos=0, position_ids=torch.arange(3))
-        logits_q  = q_model.forward(ids, start_pos=0, position_ids=torch.arange(3))
+
+    q_model = quantize_llama(model, group_size=16)
+    with torch.no_grad():
+        logits_q = q_model.forward(ids, start_pos=0, position_ids=torch.arange(3))
 
     # For INT4 with random small weights the relative error can be large; just
     # verify shapes match and no NaN.

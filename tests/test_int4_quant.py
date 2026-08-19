@@ -152,12 +152,16 @@ def test_quantize_llama_output_close():
     from engine.quantize import quantize_llama
 
     model, cfg = _make_mini_llama()
-    q_model = quantize_llama(model, group_size=64)
 
+    # fp32 forward must run before quantize_llama, which pops bf16 tensors
+    # from the shared weights dict to reclaim VRAM.
     torch.manual_seed(0)
     ids = torch.randint(0, cfg.vocab_size, (1, 8))
     with torch.no_grad():
         ref = model.forward(ids)
+
+    q_model = quantize_llama(model, group_size=64)
+    with torch.no_grad():
         out = q_model.forward(ids)
 
     rel_err = ((ref - out).norm() / ref.norm()).item()
