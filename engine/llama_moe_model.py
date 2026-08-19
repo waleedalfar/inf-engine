@@ -108,14 +108,17 @@ def _moe_block_offload(
     active_ids: list[int] = topk_ids.unique().tolist()
     expert_future = offload_mgr.prefetch_async(layer_idx, active_ids)
 
-    # Step 3 — shared expert (always fires, weights on VRAM)
+    # Step 3 — shared expert (always fires when present; absent in Qwen3-30B-A3B)
     # Runs concurrently with disk I/O when using DiskExpertManager.
-    shared_out = _swiglu(
-        h_flat,
-        base_w["mlp.shared_expert.gate_proj.weight"],
-        base_w["mlp.shared_expert.up_proj.weight"],
-        base_w["mlp.shared_expert.down_proj.weight"],
-    )
+    if "mlp.shared_expert.gate_proj.weight" in base_w:
+        shared_out = _swiglu(
+            h_flat,
+            base_w["mlp.shared_expert.gate_proj.weight"],
+            base_w["mlp.shared_expert.up_proj.weight"],
+            base_w["mlp.shared_expert.down_proj.weight"],
+        )
+    else:
+        shared_out = torch.zeros_like(h_flat)
 
     expert_tensors = expert_future.result()  # wait — usually already done
 
@@ -292,6 +295,7 @@ def load_moe_weights_disk(
     config: LlamaConfig,
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
+    cache_mb: float = 2_000,
 ) -> LlamaMoEOffloadModel:
     """Load a Qwen3-MoE model with expert weights streamed from disk.
 
@@ -352,7 +356,7 @@ def load_moe_weights_disk(
     print(f"  VRAM (non-expert): {vram_mb:.0f} MB  |  experts: on disk")
 
     print("Building disk expert index ...")
-    disk_mgr = DiskExpertManager.from_shards(shard_paths, config, device, dtype)
+    disk_mgr = DiskExpertManager.from_shards(shard_paths, config, device, dtype, cache_mb=cache_mb)
 
     weights = LlamaWeights(vram_tensors, config)
     return LlamaMoEOffloadModel(weights, disk_mgr, config)

@@ -40,13 +40,74 @@ Usage::
 from __future__ import annotations
 
 import concurrent.futures
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from pathlib import Path
 
 import torch
 from safetensors import safe_open
 
 from engine.config import LlamaConfig
+
+
+class ExpertVRAMCache:
+    """LRU cache of expert weight tensors stored on VRAM.
+
+    Sits in front of the disk reader.  During token-by-token generation the
+    same top-K experts activate on nearly every token (hidden state evolves
+    slowly), so the cache warms after token 1 and subsequent tokens pay
+    zero disk I/O for cache hits.
+
+    Memory budget: each expert in Qwen3-30B-A3B is ~4.7 MB (bf16).
+    Default 2 000 MB covers the first token's 384 active expert-layer slots
+    (48 layers × 8 experts × 4.7 MB ≈ 1 810 MB).
+
+    Args:
+        max_mb: VRAM budget for the cache in megabytes.
+    """
+
+    def __init__(self, max_mb: float = 2_000) -> None:
+        self._cache: OrderedDict[tuple[int, int], dict[str, torch.Tensor]] = OrderedDict()
+        self._max_mb = max_mb
+        self._used_mb = 0.0
+        self.hits = 0
+        self.misses = 0
+
+    @staticmethod
+    def _mb(expert_w: dict[str, torch.Tensor]) -> float:
+        return sum(t.numel() * t.element_size() for t in expert_w.values()) / 1e6
+
+    def get(self, layer_idx: int, expert_id: int) -> dict[str, torch.Tensor] | None:
+        key = (layer_idx, expert_id)
+        w = self._cache.get(key)
+        if w is not None:
+            self._cache.move_to_end(key)   # mark as most-recently used
+            self.hits += 1
+            return w
+        self.misses += 1
+        return None
+
+    def put(self, layer_idx: int, expert_id: int, tensors: dict[str, torch.Tensor]) -> None:
+        key = (layer_idx, expert_id)
+        mb = self._mb(tensors)
+        # Evict LRU entries until there is room.
+        while self._used_mb + mb > self._max_mb and self._cache:
+            _, evicted = self._cache.popitem(last=False)
+            self._used_mb -= self._mb(evicted)
+        self._cache[key] = tensors
+        self._used_mb += mb
+
+    def reset_stats(self) -> None:
+        self.hits = 0
+        self.misses = 0
+
+    @property
+    def hit_rate(self) -> float:
+        total = self.hits + self.misses
+        return self.hits / total if total else 0.0
+
+    @property
+    def used_mb(self) -> float:
+        return self._used_mb
 
 
 def _is_expert_key(key: str) -> bool:
@@ -73,6 +134,7 @@ class DiskExpertManager:
         index: dict[int, dict[int, dict[str, tuple[Path, str]]]],
         device: str,
         dtype: torch.dtype,
+        cache_mb: float = 2_000,
     ) -> None:
         self._index = index
         self._device = device
@@ -80,6 +142,7 @@ class DiskExpertManager:
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="expert-io"
         )
+        self._cache = ExpertVRAMCache(max_mb=cache_mb)
 
     # ------------------------------------------------------------------
     # Construction
@@ -92,6 +155,7 @@ class DiskExpertManager:
         config: LlamaConfig,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        cache_mb: float = 2_000,
     ) -> "DiskExpertManager":
         """Build expert index by scanning shard headers — no tensor data loaded.
 
@@ -121,9 +185,9 @@ class DiskExpertManager:
         n_experts = len(next(iter(index.values()))) if index else 0
         print(
             f"  DiskExpertManager: {n_layers} layers × {n_experts} experts indexed "
-            f"(0 MB RAM — weights stay on disk)"
+            f"(0 MB RAM — weights stay on disk, {cache_mb:.0f} MB VRAM cache)"
         )
-        return cls(index, device, dtype)
+        return cls(index, device, dtype, cache_mb=cache_mb)
 
     # ------------------------------------------------------------------
     # Internal
@@ -134,22 +198,38 @@ class DiskExpertManager:
         layer_idx: int,
         expert_ids: list[int],
     ) -> dict[int, dict[str, torch.Tensor]]:
-        """Read the requested experts from disk → VRAM.
+        """Return expert tensors on VRAM, using the cache where possible.
 
-        Reads are grouped by shard file so each file is opened at most once
-        per call, minimising filesystem overhead.
+        Cache hits skip disk entirely.  Cache misses are grouped by shard file
+        so each file is opened at most once per call.
         """
-        by_shard: dict[Path, list[tuple[int, str, str]]] = defaultdict(list)
-        for eid in expert_ids:
-            for proj_key, (shard_path, tensor_key) in self._index[layer_idx][eid].items():
-                by_shard[shard_path].append((eid, proj_key, tensor_key))
+        result: dict[int, dict[str, torch.Tensor]] = {}
+        disk_ids: list[int] = []
 
-        result: dict[int, dict[str, torch.Tensor]] = {eid: {} for eid in expert_ids}
-        for shard_path, reads in by_shard.items():
-            with safe_open(str(shard_path), framework="pt", device="cpu") as f:
-                for eid, proj_key, tensor_key in reads:
-                    t = f.get_tensor(tensor_key).to(dtype=self._dtype)
-                    result[eid][proj_key] = t.to(self._device, non_blocking=True)
+        for eid in expert_ids:
+            cached = self._cache.get(layer_idx, eid)
+            if cached is not None:
+                result[eid] = cached
+            else:
+                disk_ids.append(eid)
+
+        if disk_ids:
+            by_shard: dict[Path, list[tuple[int, str, str]]] = defaultdict(list)
+            for eid in disk_ids:
+                for proj_key, (shard_path, tensor_key) in self._index[layer_idx][eid].items():
+                    by_shard[shard_path].append((eid, proj_key, tensor_key))
+
+            disk_result: dict[int, dict[str, torch.Tensor]] = {eid: {} for eid in disk_ids}
+            for shard_path, reads in by_shard.items():
+                with safe_open(str(shard_path), framework="pt", device="cpu") as f:
+                    for eid, proj_key, tensor_key in reads:
+                        t = f.get_tensor(tensor_key).to(dtype=self._dtype)
+                        disk_result[eid][proj_key] = t.to(self._device, non_blocking=True)
+
+            for eid, tensors in disk_result.items():
+                self._cache.put(layer_idx, eid, tensors)
+                result[eid] = tensors
+
         return result
 
     # ------------------------------------------------------------------
