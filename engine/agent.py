@@ -174,7 +174,7 @@ class AgentLoop:
 
             # Build full prompt from entire history each turn.
             prompt = format_messages(history, tool_list or None, self.enable_thinking)
-            ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+            ids = self.tokenizer.encode(prompt, add_special_tokens=True)
 
             # Fresh cache — rebuilt from full history (always correct).
             cache = self.cache_factory()
