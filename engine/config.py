@@ -47,6 +47,9 @@ class LlamaConfig:
     norm_eps: float = 1e-5
     tie_word_embeddings: bool = False
     qk_norm: bool = False
+    # Explicit head dimension — Qwen3 uses head_dim=128 regardless of d_model/n_head.
+    # 0 means derive automatically as d_model // n_head (correct for LLaMA).
+    head_dim_override: int = 0
     # MoE fields (all default to 0 → dense model; set n_experts > 0 to enable MoE path).
     n_experts: int = 0                         # total routed expert count per layer
     n_experts_per_tok: int = 0                 # top-K experts activated per token
@@ -60,6 +63,8 @@ class LlamaConfig:
 
     @property
     def head_dim(self) -> int:
+        if self.head_dim_override > 0:
+            return self.head_dim_override
         if self.d_model % self.n_head != 0:
             raise ValueError(f"d_model={self.d_model} not divisible by n_head={self.n_head}")
         return self.d_model // self.n_head
@@ -147,6 +152,7 @@ QWEN3_0_6B = LlamaConfig(
     norm_eps=1e-6,
     tie_word_embeddings=True,
     qk_norm=True,
+    head_dim_override=128,
 )
 
 QWEN3_1_7B = LlamaConfig(
@@ -162,6 +168,7 @@ QWEN3_1_7B = LlamaConfig(
     norm_eps=1e-6,
     tie_word_embeddings=True,
     qk_norm=True,
+    head_dim_override=128,
 )
 
 QWEN3_4B = LlamaConfig(
@@ -176,6 +183,7 @@ QWEN3_4B = LlamaConfig(
     rope_theta=1_000_000.0,
     norm_eps=1e-6,
     qk_norm=True,
+    head_dim_override=128,
 )
 
 QWEN3_8B = LlamaConfig(
@@ -190,6 +198,7 @@ QWEN3_8B = LlamaConfig(
     rope_theta=1_000_000.0,
     norm_eps=1e-6,
     qk_norm=True,
+    head_dim_override=128,
 )
 
 QWEN3_14B = LlamaConfig(
@@ -204,6 +213,7 @@ QWEN3_14B = LlamaConfig(
     rope_theta=1_000_000.0,
     norm_eps=1e-6,
     qk_norm=True,
+    head_dim_override=128,
 )
 
 QWEN3_32B = LlamaConfig(
@@ -218,6 +228,7 @@ QWEN3_32B = LlamaConfig(
     rope_theta=1_000_000.0,
     norm_eps=1e-6,
     qk_norm=True,
+    head_dim_override=128,
 )
 
 # Qwen3-30B-A3B: 30B total parameters, ~3B active per token.
@@ -236,6 +247,7 @@ QWEN3_30B_A3B = LlamaConfig(
     rope_theta=1_000_000.0,
     norm_eps=1e-6,
     qk_norm=True,
+    head_dim_override=128,
     n_experts=128,
     n_experts_per_tok=8,
     moe_intermediate_size=768,
