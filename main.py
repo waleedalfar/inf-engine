@@ -24,11 +24,13 @@ import torch
 
 from engine.config import (
     QWEN3_0_6B, QWEN3_1_7B, QWEN3_4B, QWEN3_8B, QWEN3_14B, QWEN3_32B,
-    LlamaConfig,
+    QWEN3_30B_A3B, LlamaConfig,
 )
 from engine.kv_cache import LlamaStaticKVCache
 from engine.llama_model import LlamaModel
+from engine.llama_moe_model import load_moe_weights
 from engine.llama_weights import load_llama_weights
+from engine.quantize import quantize_llama
 from engine.qwen_tokenizer import QwenTokenizer
 from engine.agent import AgentLoop, Tool
 from engine.sampling import SamplingConfig
@@ -36,12 +38,13 @@ from engine.sampling import SamplingConfig
 # Maps directory-name fragments → config, largest first so "Qwen3-14B"
 # doesn't accidentally match before "Qwen3-1.7B".
 _DIR_TO_CONFIG: list[tuple[str, LlamaConfig]] = [
-    ("Qwen3-32B",  QWEN3_32B),
-    ("Qwen3-14B",  QWEN3_14B),
-    ("Qwen3-8B",   QWEN3_8B),
-    ("Qwen3-4B",   QWEN3_4B),
-    ("Qwen3-1.7B", QWEN3_1_7B),
-    ("Qwen3-0.6B", QWEN3_0_6B),
+    ("Qwen3-30B-A3B", QWEN3_30B_A3B),
+    ("Qwen3-32B",     QWEN3_32B),
+    ("Qwen3-14B",     QWEN3_14B),
+    ("Qwen3-8B",      QWEN3_8B),
+    ("Qwen3-4B",      QWEN3_4B),
+    ("Qwen3-1.7B",    QWEN3_1_7B),
+    ("Qwen3-0.6B",    QWEN3_0_6B),
 ]
 
 
@@ -257,10 +260,19 @@ class VerboseAgentLoop(AgentLoop):
 # Model + tokenizer loading
 # ---------------------------------------------------------------------------
 
-def load_model(model_dir: str, config: LlamaConfig, device: str, dtype: torch.dtype):
+def load_model(model_dir: str, config: LlamaConfig, device: str, dtype: torch.dtype, quantize: bool = False):
     print(f"Loading weights from {model_dir} ...")
-    weights = load_llama_weights(model_dir, config, device=device, dtype=dtype)
-    model = LlamaModel(weights, config)
+    if config.is_moe:
+        print("MoE model detected — using CPU expert offload (non-expert weights → VRAM, experts → pinned RAM)")
+        model = load_moe_weights(model_dir, config, device=device, dtype=dtype)
+    else:
+        weights = load_llama_weights(model_dir, config, device=device, dtype=dtype)
+        model = LlamaModel(weights, config)
+        if quantize:
+            print("Quantizing to INT4 W4A16 ...")
+            model = quantize_llama(model)
+            vram = torch.cuda.memory_allocated() / 1e9 if device == "cuda" else 0
+            print(f"Quantization done — {vram:.1f} GB VRAM used")
     print(f"Model ready: {config.name} on {device}")
     return model
 
@@ -302,6 +314,10 @@ def main():
         help="Enable Qwen3 chain-of-thought (<think> blocks). Off by default for speed.",
     )
     parser.add_argument(
+        "--quantize", action="store_true",
+        help="Quantize weights to INT4 after loading (required for 8B+ on 16 GB GPU).",
+    )
+    parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu",
     )
     args = parser.parse_args()
@@ -318,17 +334,22 @@ def main():
     dtype = torch.bfloat16
     config = detect_config(args.model_dir)
     tokenizer = QwenTokenizer(args.model_dir)
-    model = load_model(args.model_dir, config, args.device, dtype)
+    model = load_model(args.model_dir, config, args.device, dtype, quantize=args.quantize)
     cache_factory = make_cache_factory(config, args.device, dtype)
     tools = make_tools(workspace)
 
     # Build the system prompt. User-supplied --system overrides the default.
     system_prompt = args.system or (
-        f"You are a coding assistant with access to the user's workspace at {workspace}. "
-        "You can read files, write files, list directories, search for text, and run shell commands "
-        "— all sandboxed to that directory. "
-        "When asked to implement something, read relevant existing files first, then write clean code. "
-        "Always run tests or execute the code to verify your work before reporting success."
+        f"You are a coding assistant. The user's workspace is at {workspace}.\n\n"
+        "RULES — follow these exactly:\n"
+        "1. NEVER print code or file contents directly in your response. "
+        "Always use write_file to save code to the workspace.\n"
+        "2. When asked to create, build, generate, or write anything, use write_file immediately. "
+        "Do not ask for clarification first.\n"
+        "3. After writing files, use run_shell to verify the work "
+        "(e.g. open the file, run tests, execute the script).\n"
+        "4. Use list_dir or read_file to understand existing files before modifying them.\n"
+        "5. Keep responses short — one sentence saying what you did and which file(s) were written."
     )
 
     agent = VerboseAgentLoop(
