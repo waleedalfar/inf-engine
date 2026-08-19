@@ -207,6 +207,14 @@ def quantize_llama(
         f"{reduction:.1f}× reduction)"
     )
 
+    # Free the bf16 originals for every tensor now stored as INT4.
+    # orig._t still holds non-quantized tensors (embed_tokens, lm_head, norms)
+    # which QuantizedLlamaWeights falls back to for those keys.
+    for key in int4:
+        orig._t.pop(key, None)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     q_weights = QuantizedLlamaWeights(orig, int4, dtype)
 
     # Re-use LlamaModel with the quantized weight wrapper; RoPE tables transfer.
