@@ -63,13 +63,16 @@ def moe_mlp(
     B, T, d = x.shape
     x_flat = x.view(B * T, d)       # (S, d)  S = B*T
 
-    # --- Shared expert (fires for every token) ---
-    shared_out = _expert_forward(
-        x_flat,
-        weights["mlp.shared_expert.gate_proj.weight"],
-        weights["mlp.shared_expert.up_proj.weight"],
-        weights["mlp.shared_expert.down_proj.weight"],
-    )                                # (S, d)
+    # --- Shared expert (fires for every token, absent in some MoE models) ---
+    if "mlp.shared_expert.gate_proj.weight" in weights:
+        shared_out = _expert_forward(
+            x_flat,
+            weights["mlp.shared_expert.gate_proj.weight"],
+            weights["mlp.shared_expert.up_proj.weight"],
+            weights["mlp.shared_expert.down_proj.weight"],
+        )                            # (S, d)
+    else:
+        shared_out = torch.zeros_like(x_flat)
 
     # --- Router: compute top-K expert assignments ---
     router_logits = linear(x_flat, weights["mlp.gate.weight"])   # (S, n_experts)
