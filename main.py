@@ -33,7 +33,7 @@ from engine.llama_weights import load_llama_weights
 from engine.quantize import quantize_llama
 from engine.qwen_tokenizer import QwenTokenizer
 from engine.agent import AgentLoop, Tool
-from engine.sampling import SamplingConfig
+from engine.sampling import SamplingConfig, sample_next_token
 
 # Maps directory-name fragments → config, largest first so "Qwen3-14B"
 # doesn't accidentally match before "Qwen3-1.7B".
@@ -252,8 +252,38 @@ def make_tools(workspace: Path) -> list[Tool]:
 
 class VerboseAgentLoop(AgentLoop):
     def _execute_tool(self, call):
-        print(f"  → [tool: {call.name}]", flush=True)
+        print(f"\n  → [tool: {call.name}]", flush=True)
         return super()._execute_tool(call)
+
+    def _generate_to_eos(self, ids, cache):
+        """Stream each token to stdout as it is produced."""
+        device = self.device
+        n = len(ids)
+
+        ids_t = torch.tensor([ids], device=device)
+        pos_t = torch.arange(n, device=device)
+
+        logits = self.model.forward(ids_t, cache=cache, start_pos=0, position_ids=pos_t)
+        next_tok = sample_next_token(logits[:, -1:, :], self.sampling).item()
+
+        generated: list[int] = [next_tok]
+        pos = n
+
+        print("Agent: ", end="", flush=True)
+
+        while next_tok != self.eos_token_id and len(generated) < self.max_new_tokens:
+            piece = self.tokenizer.decode([next_tok], skip_special_tokens=True)
+            print(piece, end="", flush=True)
+
+            tok_t = torch.tensor([[next_tok]], device=device)
+            pos_s = torch.tensor([pos], device=device)
+            logits = self.model.forward(tok_t, cache=cache, start_pos=pos, position_ids=pos_s)
+            pos += 1
+            next_tok = sample_next_token(logits[:, -1:, :], self.sampling).item()
+            generated.append(next_tok)
+
+        print()  # newline after streamed output
+        return generated
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +302,7 @@ def load_model(model_dir: str, config: LlamaConfig, device: str, dtype: torch.dt
             print("Quantizing to INT4 W4A16 ...")
             model = quantize_llama(model)
             vram = torch.cuda.memory_allocated() / 1e9 if device == "cuda" else 0
-            print(f"Quantization done — {vram:.1f} GB VRAM used")
+            print(f"Quantization done — {vram:.1f} GB VRAM in use (bf16 originals freed)")
     print(f"Model ready: {config.name} on {device}")
     return model
 
@@ -406,10 +436,10 @@ def main():
             continue
 
         messages.append({"role": "user", "content": user_input})
+        print()  # blank line before streamed output
         result = agent.run(messages)
         messages = result.messages  # accumulate full history for next turn
-
-        print(f"\nAgent: {result.final_text}\n")
+        print()
 
 
 if __name__ == "__main__":
