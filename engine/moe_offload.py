@@ -31,6 +31,8 @@ Usage:
 
 from __future__ import annotations
 
+import concurrent.futures
+
 import torch
 
 from engine.config import LlamaConfig
@@ -130,6 +132,22 @@ class ExpertOffloadManager:
                 k: v.to(self._device, non_blocking=False) for k, v in cpu_w.items()
             }
         return result
+
+    def prefetch_async(
+        self,
+        layer_idx: int,
+        expert_ids: list[int],
+    ) -> concurrent.futures.Future:
+        """Async wrapper around fetch for API parity with DiskExpertManager.
+
+        RAM copies are fast enough that the async overhead is negligible, but
+        using the same interface lets the MoE forward work with either manager.
+        """
+        if not hasattr(self, "_executor"):
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="expert-ram"
+            )
+        return self._executor.submit(self.fetch, layer_idx, expert_ids)
 
     def get_layer_weights(
         self,

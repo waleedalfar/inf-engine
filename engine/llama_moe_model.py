@@ -28,6 +28,7 @@ import torch
 from safetensors import safe_open
 
 from engine.config import LlamaConfig
+from engine.disk_expert_manager import DiskExpertManager
 from engine.kv_cache import LlamaStaticKVCache
 from engine.layers import precompute_rope_freqs, rms_norm
 from engine.llama_attention import llama_attention
@@ -103,17 +104,20 @@ def _moe_block_offload(
     topk_w, topk_ids = torch.topk(router_probs, config.n_experts_per_tok, dim=-1)
     topk_w = topk_w / topk_w.sum(dim=-1, keepdim=True)                # renormalise
 
-    # Step 2 — fetch only the unique active experts (~K × 4.7 MB)
+    # Step 2 — kick off async expert fetch (disk: triggers I/O; RAM: near-instant)
     active_ids: list[int] = topk_ids.unique().tolist()
-    expert_tensors = offload_mgr.fetch(layer_idx, active_ids)          # CPU → VRAM
+    expert_future = offload_mgr.prefetch_async(layer_idx, active_ids)
 
     # Step 3 — shared expert (always fires, weights on VRAM)
+    # Runs concurrently with disk I/O when using DiskExpertManager.
     shared_out = _swiglu(
         h_flat,
         base_w["mlp.shared_expert.gate_proj.weight"],
         base_w["mlp.shared_expert.up_proj.weight"],
         base_w["mlp.shared_expert.down_proj.weight"],
     )
+
+    expert_tensors = expert_future.result()  # wait — usually already done
 
     # Step 4 — routed experts (only active ones)
     routed_out = torch.zeros_like(h_flat)
@@ -281,3 +285,74 @@ def load_moe_weights(
     weights    = LlamaWeights(vram_tensors, config)
     offload_mgr = ExpertOffloadManager(cpu_experts, device)
     return LlamaMoEOffloadModel(weights, offload_mgr, config)
+
+
+def load_moe_weights_disk(
+    model_dir: str | Path,
+    config: LlamaConfig,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+) -> LlamaMoEOffloadModel:
+    """Load a Qwen3-MoE model with expert weights streamed from disk.
+
+    Non-expert weights (attention, norms, shared expert, router) go to VRAM.
+    Routed expert weights are NOT loaded — only a disk index is built.
+    At inference, only the active top-K experts are read per layer.
+
+    Memory requirements (Qwen3-30B-A3B):
+        VRAM:  ~1.4 GB  (non-expert weights + KV cache)
+        RAM:   ~38 MB   peak per token (one layer's top-8 experts in flight)
+        Disk:  ~57 GB   expert weights remain on disk throughout
+
+    Args:
+        model_dir: Directory with safetensors shards + index.json.
+        config:    Must be a MoE config (``config.is_moe == True``).
+        device:    VRAM device string (default ``"cuda"``).
+        dtype:     Weight dtype (default ``bfloat16``).
+
+    Returns:
+        :class:`LlamaMoEOffloadModel` using a :class:`DiskExpertManager`.
+    """
+    if not config.is_moe:
+        raise ValueError(
+            f"load_moe_weights_disk requires a MoE config; "
+            f"got '{config.name}' with n_experts={config.n_experts}."
+        )
+
+    model_dir = Path(model_dir)
+    if not model_dir.is_dir():
+        raise FileNotFoundError(f"model directory not found: {model_dir}")
+
+    single = model_dir / "model.safetensors"
+    index_file = model_dir / "model.safetensors.index.json"
+
+    if single.is_file():
+        shard_paths = [single]
+    elif index_file.is_file():
+        with open(index_file) as f:
+            shard_map: dict[str, str] = json.load(f)["weight_map"]
+        shard_paths = [model_dir / s for s in sorted(set(shard_map.values()))]
+    else:
+        raise FileNotFoundError(
+            f"No safetensors found in {model_dir}. "
+            "Expected model.safetensors or model.safetensors.index.json."
+        )
+
+    vram_tensors: dict[str, torch.Tensor] = {}
+    n_shards = len(shard_paths)
+    print(f"Loading non-expert weights to VRAM ({n_shards} shards) ...")
+    for idx, shard_path in enumerate(shard_paths, 1):
+        print(f"  [{idx}/{n_shards}] {shard_path.name}", flush=True)
+        with safe_open(str(shard_path), framework="pt", device="cpu") as f:
+            for key in f.keys():  # noqa: SIM118
+                if not _is_expert(key):
+                    vram_tensors[key] = f.get_tensor(key).to(dtype=dtype).to(device)
+
+    vram_mb = sum(t.numel() * t.element_size() for t in vram_tensors.values()) / 1e6
+    print(f"  VRAM (non-expert): {vram_mb:.0f} MB  |  experts: on disk")
+
+    print("Building disk expert index ...")
+    disk_mgr = DiskExpertManager.from_shards(shard_paths, config, device, dtype)
+
+    weights = LlamaWeights(vram_tensors, config)
+    return LlamaMoEOffloadModel(weights, disk_mgr, config)

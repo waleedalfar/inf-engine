@@ -28,7 +28,7 @@ from engine.config import (
 )
 from engine.kv_cache import LlamaStaticKVCache
 from engine.llama_model import LlamaModel
-from engine.llama_moe_model import load_moe_weights
+from engine.llama_moe_model import load_moe_weights, load_moe_weights_disk
 from engine.llama_weights import load_llama_weights
 from engine.quantize import quantize_llama
 from engine.qwen_tokenizer import QwenTokenizer
@@ -290,11 +290,22 @@ class VerboseAgentLoop(AgentLoop):
 # Model + tokenizer loading
 # ---------------------------------------------------------------------------
 
-def load_model(model_dir: str, config: LlamaConfig, device: str, dtype: torch.dtype, quantize: bool = False):
+def load_model(
+    model_dir: str,
+    config: LlamaConfig,
+    device: str,
+    dtype: torch.dtype,
+    quantize: bool = False,
+    expert_offload: str = "disk",
+):
     print(f"Loading weights from {model_dir} ...")
     if config.is_moe:
-        print("MoE model detected — using CPU expert offload (non-expert weights → VRAM, experts → pinned RAM)")
-        model = load_moe_weights(model_dir, config, device=device, dtype=dtype)
+        if expert_offload == "ram":
+            print("MoE model — RAM expert offload (needs ~57 GB RAM for 30B-A3B)")
+            model = load_moe_weights(model_dir, config, device=device, dtype=dtype)
+        else:
+            print("MoE model — disk expert offload (~38 MB RAM peak per token)")
+            model = load_moe_weights_disk(model_dir, config, device=device, dtype=dtype)
     else:
         weights = load_llama_weights(model_dir, config, device=device, dtype=dtype)
         model = LlamaModel(weights, config)
@@ -350,6 +361,12 @@ def main():
     parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu",
     )
+    parser.add_argument(
+        "--expert-offload", choices=["disk", "ram"], default="disk",
+        help="MoE expert offload mode: 'disk' streams from safetensors (needs ~0 RAM), "
+             "'ram' loads all experts into pinned CPU RAM (needs ~57 GB for 30B-A3B). "
+             "Default: disk.",
+    )
     args = parser.parse_args()
 
     try:
@@ -364,7 +381,11 @@ def main():
     dtype = torch.bfloat16
     config = detect_config(args.model_dir)
     tokenizer = QwenTokenizer(args.model_dir)
-    model = load_model(args.model_dir, config, args.device, dtype, quantize=args.quantize)
+    model = load_model(
+        args.model_dir, config, args.device, dtype,
+        quantize=args.quantize,
+        expert_offload=args.expert_offload,
+    )
     cache_factory = make_cache_factory(config, args.device, dtype)
     tools = make_tools(workspace)
 
