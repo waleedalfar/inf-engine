@@ -19,6 +19,8 @@ from typing import Any
 
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+# JSON only allows \n \r \t \\ \" \/ \uXXXX — models sometimes emit \xNN.
+_INVALID_HEX_ESCAPE = re.compile(r"\\x([0-9a-fA-F]{2})")
 
 
 @dataclass
@@ -29,17 +31,36 @@ class ToolCall:
     arguments: dict = field(default_factory=dict)
 
 
+def _repair_json(raw: str) -> str:
+    r"""Replace \xNN hex escapes (invalid in JSON) with \\xNN (escaped backslash + x)."""
+    return _INVALID_HEX_ESCAPE.sub(r"\\\\x\1", raw)
+
+
 def extract_tool_calls(text: str) -> list[ToolCall]:
     """Find and parse every ``<tool_call>…</tool_call>`` block in *text*.
 
-    Blocks with malformed JSON or without a ``name`` key are skipped.
+    On JSONDecodeError, attempts to repair common model mistakes (e.g. bare
+    ``\\xNN`` hex escapes that are invalid in JSON) before giving up.
+    Blocks that still fail to parse are skipped with a warning printed to
+    stderr so the agent loop can keep running.
     """
+    import sys
     calls: list[ToolCall] = []
     for m in _TOOL_CALL_RE.finditer(text):
+        raw = m.group(1)
         try:
-            data = json.loads(m.group(1))
+            data = json.loads(raw)
         except (json.JSONDecodeError, ValueError):
-            continue
+            repaired = _repair_json(raw)
+            try:
+                data = json.loads(repaired)
+            except (json.JSONDecodeError, ValueError):
+                print(
+                    f"  [tool_parser] dropped malformed tool call (JSON parse failed)\n"
+                    f"  {raw[:120]}{'...' if len(raw) > 120 else ''}",
+                    file=sys.stderr,
+                )
+                continue
         if "name" not in data:
             continue
         calls.append(ToolCall(name=data["name"], arguments=data.get("arguments", {})))

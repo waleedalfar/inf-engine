@@ -297,6 +297,17 @@ class TestExtractToolCalls:
         assert len(calls) == 1
         assert calls[0].name == "ok"
 
+    def test_hex_escape_in_content_repaired(self):
+        # Models sometimes emit \xNN in JSON strings (invalid JSON; only \uXXXX is allowed).
+        # The parser must repair and recover rather than silently drop the tool call.
+        text = '<tool_call>{"name": "write_file", "arguments": {"path": "x.py", "content": "b\'\\x00\'"}}</tool_call>'
+        calls = extract_tool_calls(text)
+        assert len(calls) == 1
+        assert calls[0].name == "write_file"
+        assert calls[0].arguments["path"] == "x.py"
+        # After repair, \x00 becomes \\x00 in the string value (backslash + x00)
+        assert "x00" in calls[0].arguments["content"]
+
     def test_missing_name_key_skipped(self):
         text = '<tool_call>{"arguments": {"a": 1}}</tool_call>'
         assert extract_tool_calls(text) == []
