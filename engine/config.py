@@ -1,12 +1,8 @@
-"""GPT-2 model configuration.
+"""Model configuration for the Qwen3 inference engine.
 
-Every dimension the engine uses is named and typed here. No other module is
-allowed to hardcode a model dimension as a bare integer — they read it from a
-``GPT2Config`` instance. This keeps every model dimension defined in one place.
-
-The numeric values below are the published GPT-2 hyperparameters (Radford et al.,
-2019) and must match the HuggingFace ``GPT2Config`` for the correctness gate to
-pass token-for-token.
+Every dimension the engine uses is named and typed here — no bare integer
+literals in model code. Supported families: LLaMA 3, SmolLM2, Qwen3 (dense
+and MoE).
 """
 
 from __future__ import annotations
@@ -256,6 +252,7 @@ QWEN3_30B_A3B = LlamaConfig(
     shared_expert_intermediate_size=0,  # no shared expert in Qwen3-30B-A3B
 )
 
+
 LLAMA_CONFIGS: dict[str, LlamaConfig] = {
     LLAMA_3_2_1B.name: LLAMA_3_2_1B,
     LLAMA_3_2_3B.name: LLAMA_3_2_3B,
@@ -277,77 +274,3 @@ def get_llama_config(name: str) -> LlamaConfig:
     return LLAMA_CONFIGS[name]
 
 
-@dataclass(frozen=True)
-class GPT2Config:
-    """Hyperparameters that fully determine the GPT-2 forward pass.
-
-    Attributes:
-        name: HuggingFace model id (e.g. ``"gpt2"``). Used to locate weights.
-        vocab_size: Number of tokens in the BPE vocabulary (V).
-        n_ctx: Maximum context length / number of learned position embeddings (n_ctx).
-        d_model: Residual stream width, a.k.a. ``n_embd`` (d_model).
-        n_layer: Number of transformer blocks (L).
-        n_head: Number of attention heads (H).
-        layer_norm_eps: Epsilon added to variance inside LayerNorm for stability.
-        mlp_ratio: Hidden-layer expansion factor of the MLP (GPT-2 uses 4x).
-
-    Derived:
-        head_dim: Per-head width = d_model // n_head (d_head).
-        d_mlp: MLP hidden width = mlp_ratio * d_model (d_ff).
-    """
-
-    name: str
-    vocab_size: int
-    n_ctx: int
-    d_model: int
-    n_layer: int
-    n_head: int
-    layer_norm_eps: float = 1e-5
-    mlp_ratio: int = 4
-
-    @property
-    def head_dim(self) -> int:
-        """Width of a single attention head (d_head = d_model / n_head)."""
-        if self.d_model % self.n_head != 0:
-            raise ValueError(
-                f"d_model={self.d_model} not divisible by n_head={self.n_head}"
-            )
-        return self.d_model // self.n_head
-
-    @property
-    def d_mlp(self) -> int:
-        """Hidden width of the MLP block (d_ff = mlp_ratio * d_model)."""
-        return self.mlp_ratio * self.d_model
-
-
-# Published GPT-2 sizes. We verify correctness on `gpt2` (small) and benchmark
-# on both `gpt2` and `gpt2-medium`.
-GPT2_SMALL = GPT2Config(
-    name="gpt2",
-    vocab_size=50257,
-    n_ctx=1024,
-    d_model=768,
-    n_layer=12,
-    n_head=12,
-)
-
-GPT2_MEDIUM = GPT2Config(
-    name="gpt2-medium",
-    vocab_size=50257,
-    n_ctx=1024,
-    d_model=1024,
-    n_layer=24,
-    n_head=16,
-)
-
-CONFIGS: dict[str, GPT2Config] = {
-    GPT2_SMALL.name: GPT2_SMALL,
-    GPT2_MEDIUM.name: GPT2_MEDIUM,
-}
-
-
-def get_config(name: str) -> GPT2Config:
-    """Return the GPT2Config for a known model name (``gpt2`` or ``gpt2-medium``)."""
-    if name not in CONFIGS:
-        raise KeyError(f"unknown model '{name}'; known: {sorted(CONFIGS)}")
-    return CONFIGS[name]

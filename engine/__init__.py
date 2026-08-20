@@ -1,51 +1,42 @@
-"""Minimal LLM inference engine built from scratch (no HuggingFace, no vLLM).
+"""Qwen3 inference engine built from scratch (no HuggingFace, no vLLM).
 
-GPT-2 (original engine):
-    GPT2Config, get_config        -- model hyperparameters
-    load_weights, GPT2Weights     -- raw safetensors loading
-    GPT2Model                     -- forward pass + generation
-    GPT2Tokenizer                 -- GPT-2 BPE via tiktoken
-
-LLaMA family (scale-up):
-    LlamaConfig, get_llama_config -- LLaMA / Mistral / Qwen hyperparameters
+LLaMA / Qwen3 dense:
+    LlamaConfig, get_llama_config -- hyperparameters
     load_llama_weights            -- sharded safetensors loading
-    LlamaWeights                  -- named LLaMA tensors
+    LlamaWeights                  -- named tensors
     LlamaModel                    -- forward pass + cached generation
-    LlamaStaticKVCache            -- GQA-aware static KV cache (stores n_kv_heads)
+    LlamaStaticKVCache            -- GQA-aware static KV cache
+
+Paged / continuous batching:
     BlockManager                  -- physical block pool for paged allocation
-    PagedLlamaKVCache             -- paged KV cache (block-based, non-contiguous)
-    LlamaPagedEngine              -- continuous batching engine with paged cache
+    PagedLlamaKVCache             -- block-based non-contiguous KV cache
+    LlamaPagedEngine              -- continuous batching engine
     LlamaRequest                  -- request dataclass for LlamaPagedEngine
-    SpeculativeDecoder            -- draft+verify speculative decoding (Phase 4)
-    SpecStats                     -- acceptance statistics for speculative decoding
 
-Qwen3 dense (Phase 5):
-    QWEN3_0_6B .. QWEN3_32B      -- pre-built Qwen3 config constants
-    QwenTokenizer                 -- tiktoken-based Qwen BPE tokenizer (no HF dep)
+Speculative decoding:
+    SpeculativeDecoder            -- draft+verify for 2-4x throughput
+    SpecStats                     -- acceptance statistics
 
-Qwen3 MoE (Phase 6):
-    QWEN3_30B_A3B                 -- Qwen3-30B-A3B config (128 experts, top-8)
-    ExpertOffloadManager          -- CPU-pinned expert cache with VRAM fetch/evict
+Qwen3 configs:
+    QWEN3_0_6B .. QWEN3_32B      -- dense model constants
+    QWEN3_30B_A3B                 -- MoE config (128 experts, top-8)
+    QwenTokenizer                 -- tiktoken-based BPE tokenizer (no HF dep)
 
-Agentic loop (Phase 7):
-    format_messages               -- OpenAI-style message list → Qwen3 ChatML string
+Qwen3 MoE:
+    ExpertOffloadManager          -- CPU-pinned expert cache with VRAM fetch
+    DiskExpertManager             -- disk-streaming expert loader with VRAM LRU cache
+
+Agentic loop:
+    format_messages               -- message list → Qwen3 ChatML string
     extract_tool_calls            -- parse <tool_call> blocks from model output
-    has_tool_call                 -- quick check for tool call presence
-    strip_thinking                -- remove <think>…</think> blocks from output
-    format_tool_result            -- serialise a tool return value for injection
-    Tool                          -- tool descriptor (name, description, schema, fn)
-    AgentResult                   -- completed run with final text + history + stats
-    AgentLoop                     -- multi-turn generate → parse → execute loop
+    has_tool_call, strip_thinking, format_tool_result
+    Tool, AgentResult, AgentLoop
 
 Shared:
     SamplingConfig, SamplingMode  -- greedy / top-k / top-p decoding
-
-See ROADMAP.md for the scale-up plan and phase status.
 """
 
-from engine.batching import generate_batched, left_pad
 from engine.config import (
-    GPT2Config,
     LlamaConfig,
     QWEN3_0_6B,
     QWEN3_1_7B,
@@ -54,30 +45,20 @@ from engine.config import (
     QWEN3_14B,
     QWEN3_32B,
     QWEN3_30B_A3B,
-    get_config,
     get_llama_config,
 )
-from engine.continuous import ContinuousBatchingEngine, Policy, Request
-from engine.kv_cache import (
-    DynamicKVCache,
-    KVCache,
-    LlamaStaticKVCache,
-    SlotKVCache,
-    StaticKVCache,
-    kv_cache_bytes,
-)
+from engine.kv_cache import LlamaStaticKVCache
 from engine.llama_model import LlamaModel
 from engine.llama_paged_engine import LlamaPagedEngine, LlamaRequest
 from engine.llama_weights import LlamaWeights, load_llama_weights
-from engine.model import GPT2Model
 from engine.paged_cache import BlockManager, PagedLlamaKVCache
 from engine.agent import AgentLoop, AgentResult, Tool
 from engine.chat import format_messages
+from engine.disk_expert_manager import DiskExpertManager
 from engine.moe_offload import ExpertOffloadManager
 from engine.qwen_tokenizer import QwenTokenizer
 from engine.sampling import SamplingConfig, SamplingMode
 from engine.speculative import SpecStats, SpeculativeDecoder
-from engine.tokenizer import GPT2Tokenizer
 from engine.tool_parser import (
     ToolCall,
     extract_tool_calls,
@@ -85,43 +66,37 @@ from engine.tool_parser import (
     has_tool_call,
     strip_thinking,
 )
-from engine.weights import GPT2Weights, load_weights
 
 __all__ = [
-    # GPT-2
-    "GPT2Config",
-    "get_config",
-    "GPT2Model",
-    "GPT2Tokenizer",
-    "GPT2Weights",
-    "load_weights",
-    # LLaMA — static path
+    # Config
     "LlamaConfig",
     "get_llama_config",
+    # Dense model
     "LlamaModel",
     "LlamaWeights",
     "load_llama_weights",
     "LlamaStaticKVCache",
-    # LLaMA — paged path (Phase 3)
+    # Paged engine
     "BlockManager",
     "PagedLlamaKVCache",
     "LlamaPagedEngine",
     "LlamaRequest",
-    # LLaMA — speculative decoding (Phase 4)
+    # Speculative decoding
     "SpeculativeDecoder",
     "SpecStats",
-    # Qwen3 dense (Phase 5)
+    # Qwen3 configs
     "QWEN3_0_6B",
     "QWEN3_1_7B",
     "QWEN3_4B",
     "QWEN3_8B",
     "QWEN3_14B",
     "QWEN3_32B",
-    "QwenTokenizer",
-    # Qwen3 MoE (Phase 6)
     "QWEN3_30B_A3B",
+    "QwenTokenizer",
+    # MoE
     "ExpertOffloadManager",
-    # Agentic loop (Phase 7)
+    "DiskExpertManager",
+    # Agentic loop
     "format_messages",
     "extract_tool_calls",
     "has_tool_call",
@@ -134,14 +109,4 @@ __all__ = [
     # Shared
     "SamplingConfig",
     "SamplingMode",
-    "KVCache",
-    "StaticKVCache",
-    "DynamicKVCache",
-    "kv_cache_bytes",
-    "generate_batched",
-    "left_pad",
-    "SlotKVCache",
-    "ContinuousBatchingEngine",
-    "Policy",
-    "Request",
 ]
