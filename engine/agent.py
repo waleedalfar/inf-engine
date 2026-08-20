@@ -59,6 +59,38 @@ from engine.tool_parser import (
 )
 
 
+def _truncate_history(
+    history: list[dict],
+    token_limit: int,
+    tokenizer: Any,
+    tool_list: list,
+    enable_thinking: bool,
+) -> list[dict]:
+    """Drop middle turns until the formatted prompt fits within token_limit.
+
+    Keeps the system message (index 0) and trims oldest non-system messages
+    first, preserving the most recent context. Stops as soon as it fits or
+    only one message remains.
+    """
+    # Separate system message from the rest.
+    sys_msgs = [m for m in history if m["role"] == "system"]
+    convo = [m for m in history if m["role"] != "system"]
+
+    while len(convo) > 1:
+        prompt = format_messages(sys_msgs + convo, tool_list or None, enable_thinking)
+        ids = tokenizer.encode(prompt, add_special_tokens=True)
+        if len(ids) <= token_limit:
+            break
+        convo.pop(0)  # drop oldest non-system message
+
+    if sys_msgs:
+        print(
+            f"  [context truncated: keeping system + last {len(convo)} messages]",
+            flush=True,
+        )
+    return sys_msgs + convo
+
+
 @dataclass
 class Tool:
     """A Python function exposed to the model as a callable tool.
@@ -129,6 +161,7 @@ class AgentLoop:
         enable_thinking: bool = False,
         device: str | None = None,
         eos_token_id: int | None = None,
+        max_ctx: int | None = None,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -146,6 +179,7 @@ class AgentLoop:
         if eos_token_id is None:
             eos_token_id = getattr(tokenizer, "im_end_id", 151645)
         self.eos_token_id = eos_token_id
+        self.max_ctx = max_ctx
 
     # ------------------------------------------------------------------
     # Public interface
@@ -175,6 +209,16 @@ class AgentLoop:
             # Build full prompt from entire history each turn.
             prompt = format_messages(history, tool_list or None, self.enable_thinking)
             ids = self.tokenizer.encode(prompt, add_special_tokens=True)
+
+            # Graceful overflow: drop middle turns when prompt would overflow cache.
+            if self.max_ctx is not None:
+                hard_limit = self.max_ctx - self.max_new_tokens
+                if len(ids) > hard_limit and len(history) > 2:
+                    history = _truncate_history(
+                        history, hard_limit, self.tokenizer, tool_list, self.enable_thinking
+                    )
+                    prompt = format_messages(history, tool_list or None, self.enable_thinking)
+                    ids = self.tokenizer.encode(prompt, add_special_tokens=True)
 
             # Fresh cache — rebuilt from full history (always correct).
             cache = self.cache_factory()

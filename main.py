@@ -41,6 +41,7 @@ from engine.quantize import quantize_llama, quantized_to_device
 from engine.qwen_tokenizer import QwenTokenizer
 from engine.agent import AgentLoop, Tool
 from engine.sampling import SamplingConfig, sample_next_token
+from engine.speculative import SpeculativeDecoder
 
 # ---------------------------------------------------------------------------
 # Session history helpers
@@ -381,6 +382,57 @@ class VerboseAgentLoop(AgentLoop):
             return None
 
 
+class SpeculativeVerboseAgentLoop(VerboseAgentLoop):
+    """VerboseAgentLoop that uses a small draft model to speed up generation.
+
+    Wraps SpeculativeDecoder so each generate call runs draft-then-verify
+    instead of single-token decoding. Prints acceptance rate with tok/s.
+    """
+
+    def __init__(self, *args, spec_decoder: SpeculativeDecoder, draft_cache_factory, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.spec_decoder = spec_decoder
+        self.draft_cache_factory = draft_cache_factory
+
+    def _generate_to_eos(self, ids: list[int], cache) -> list[int]:
+        import time
+        device = self.device
+        ids_t = torch.tensor([ids], device=device)          # (1, T_p)
+
+        draft_cache = self.draft_cache_factory()
+
+        print("Agent: ", end="", flush=True)
+        t0 = time.perf_counter()
+
+        out_t, stats = self.spec_decoder.generate(
+            ids_t,
+            max_new_tokens=self.max_new_tokens,
+            draft_cache=draft_cache,
+            target_cache=cache,
+            sampling=self.sampling,
+            eos_token=self.eos_token_id,
+        )
+
+        elapsed = time.perf_counter() - t0
+        gen_ids = out_t[0, len(ids):].tolist()
+
+        # Decode and print the completed output (batch print — spec decoding
+        # generates multiple tokens per step so streaming is not straightforward).
+        trim = gen_ids[:-1] if gen_ids and gen_ids[-1] == self.eos_token_id else gen_ids
+        text = self.tokenizer.decode(trim, skip_special_tokens=True)
+        print(text, flush=True)
+
+        n_gen = len(gen_ids)
+        tps = n_gen / elapsed if elapsed > 0 else 0
+        print(
+            f"\n  [{n_gen} tokens, {tps:.2f} tok/s | "
+            f"spec accept {stats.acceptance_rate:.0%}, "
+            f"{stats.tokens_per_step:.1f} tok/step]",
+            flush=True,
+        )
+        return gen_ids
+
+
 # ---------------------------------------------------------------------------
 # Model + tokenizer loading
 # ---------------------------------------------------------------------------
@@ -427,7 +479,7 @@ def load_model(
     return model
 
 
-def make_cache_factory(config: LlamaConfig, device: str, dtype: torch.dtype, max_seq: int = 4096):
+def make_cache_factory(config: LlamaConfig, device: str, dtype: torch.dtype, max_seq: int = 8192):
     def factory():
         return LlamaStaticKVCache(config, batch=1, max_seq=max_seq, device=device, dtype=dtype)
     return factory
@@ -461,8 +513,23 @@ def main():
         help="Max tool-call iterations per user message (default: 8)",
     )
     parser.add_argument(
+        "--max-ctx", type=int, default=8192,
+        help="KV cache size in tokens (default: 8192). Qwen3 supports up to 32768. "
+             "Larger values use more VRAM (Qwen3-8B INT4: ~0.5 GB per 4096 tokens of KV).",
+    )
+    parser.add_argument(
         "--thinking", action="store_true",
         help="Enable Qwen3 chain-of-thought (<think> blocks). Off by default for speed.",
+    )
+    parser.add_argument(
+        "--draft-model-dir", default=None,
+        help="Path to a small draft model for speculative decoding "
+             "(e.g. weights/Qwen--Qwen3-0.6B). If set, enables speculative decoding "
+             "which typically gives 2-3× throughput on coding tasks.",
+    )
+    parser.add_argument(
+        "--n-draft", type=int, default=4,
+        help="Number of draft tokens to speculate per step (default: 4).",
     )
     quant_group = parser.add_mutually_exclusive_group()
     quant_group.add_argument(
@@ -537,7 +604,16 @@ def main():
         expert_offload=args.expert_offload,
         cache_mb=args.cache_mb,
     )
-    cache_factory = make_cache_factory(config, args.device, dtype)
+    cache_factory = make_cache_factory(config, args.device, dtype, max_seq=args.max_ctx)
+
+    # Optional speculative decoding: load a small draft model.
+    draft_model = None
+    draft_config = None
+    if args.draft_model_dir:
+        draft_config = detect_config(args.draft_model_dir)
+        print(f"Loading draft model {draft_config.name} for speculative decoding ...")
+        draft_model = load_model(args.draft_model_dir, draft_config, args.device, dtype, quantize=False)
+
     tools = make_tools(workspace)
 
     # Build the system prompt. User-supplied --system overrides the default.
@@ -554,7 +630,7 @@ def main():
         "5. Keep responses short — one sentence saying what you did and which file(s) were written."
     )
 
-    agent = VerboseAgentLoop(
+    agent_kwargs = dict(
         model=model,
         tokenizer=tokenizer,
         cache_factory=cache_factory,
@@ -564,7 +640,20 @@ def main():
         max_new_tokens=args.max_new_tokens,
         enable_thinking=args.thinking,
         device=args.device,
+        max_ctx=args.max_ctx,
     )
+
+    if draft_model is not None:
+        spec_decoder = SpeculativeDecoder(draft=draft_model, target=model, n_draft=args.n_draft)
+        draft_cache_factory = make_cache_factory(draft_config, args.device, dtype, max_seq=args.max_ctx)
+        agent = SpeculativeVerboseAgentLoop(
+            **agent_kwargs,
+            spec_decoder=spec_decoder,
+            draft_cache_factory=draft_cache_factory,
+        )
+        print(f"Speculative decoding enabled: {draft_config.name} draft, {args.n_draft} tokens/step")
+    else:
+        agent = VerboseAgentLoop(**agent_kwargs)
 
     print(f"\nWorkspace: {workspace}")
     print("Type /exit to quit, /clear to reset, /tools to list tools, /history to review.\n")
