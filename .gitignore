@@ -21,3 +21,11 @@ plots/scratch/
 .DS_Store
 .idea/
 .vscode/
+
+# Claude Code: per-user local permissions, not shared team config.
+.claude/settings.local.json
+
+# Private incident/debugging write-ups — kept locally for reference, not for
+# the public repo. The distilled, actionable version of each lesson lives in
+# .claude/skills/ (tracked) so future sessions still apply it automatically.
+docs/lessons/

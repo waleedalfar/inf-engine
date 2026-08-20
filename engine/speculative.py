@@ -48,7 +48,12 @@ import torch
 
 from engine.kv_cache import LlamaStaticKVCache
 from engine.llama_model import LlamaModel
-from engine.sampling import SamplingConfig, SamplingMode, sample_next_token
+from engine.sampling import (
+    SamplingConfig,
+    SamplingMode,
+    _apply_repetition_penalty,
+    sample_next_token,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -80,19 +85,32 @@ class SpecStats:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _get_probs(logits: torch.Tensor, cfg: SamplingConfig) -> torch.Tensor:
+def _get_probs(
+    logits: torch.Tensor,
+    cfg: SamplingConfig,
+    context_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Convert next-token logits to a probability distribution matching ``cfg``.
 
-    Applies temperature scaling and top-k/top-p masking in the same way that
-    ``sample_next_token`` does, so draft and target distributions are comparable.
+    Applies repetition penalty (if configured), temperature scaling, and
+    top-k/top-p masking in the same way that ``sample_next_token`` does, so
+    draft and target distributions are comparable.
 
     Args:
-        logits: (vocab_size,) raw logits for one position.
-        cfg:    Sampling configuration.
+        logits:      (vocab_size,) raw logits for one position.
+        cfg:         Sampling configuration.
+        context_ids: All token ids seen so far (1-D). Used for repetition
+                     penalty when ``cfg.repetition_penalty != 1.0``.
 
     Returns:
         (vocab_size,) probability distribution (sums to 1).
     """
+    if cfg.repetition_penalty != 1.0 and context_ids is not None:
+        # _apply_repetition_penalty expects (B, V); unsqueeze/squeeze around it.
+        logits = _apply_repetition_penalty(
+            logits.unsqueeze(0), context_ids, cfg.repetition_penalty
+        ).squeeze(0)
+
     if cfg.mode is SamplingMode.GREEDY:
         # One-hot at argmax — avoids float noise in the correction formula.
         probs = torch.zeros_like(logits)
@@ -228,6 +246,7 @@ class SpeculativeDecoder:
                            start_pos=0, position_ids=pos)
 
         # Sample first token from target (target is always authoritative).
+        # No penalty context yet — penalty tracks generated tokens only.
         first_tok = sample_next_token(target_logits[:, -1, :], cfg)   # (1, 1)
         out = torch.cat([input_ids, first_tok], dim=1)
         if eos_token is not None and first_tok.item() == eos_token:
@@ -241,6 +260,10 @@ class SpeculativeDecoder:
 
         while generated < max_new_tokens:
             K = min(self.n_draft, max_new_tokens - generated)
+            # Only generated tokens (not the prompt) as the penalty context.
+            # Using the full out[0] would include prompt tokens that appear
+            # many times in long system prompts, causing over-suppression.
+            step_context = out[0, T_p:]                                # (n_generated,)
 
             # ── DRAFT PHASE ───────────────────────────────────────────────
             # Run draft K times; store full distributions for the correction formula.
@@ -252,7 +275,7 @@ class SpeculativeDecoder:
                 pos_k = torch.tensor([L + k], device=device)
                 d_logits = self.draft.forward(cur, cache=draft_cache,
                                               start_pos=L + k, position_ids=pos_k)
-                d_probs = _get_probs(d_logits[0, -1], cfg)            # (vocab,)
+                d_probs = _get_probs(d_logits[0, -1], cfg, context_ids=step_context)  # (vocab,)
                 tok = _sample_from_probs(d_probs, cfg)                # (1, 1)
                 draft_tokens.append(tok)
                 draft_probs.append(d_probs)
@@ -275,7 +298,7 @@ class SpeculativeDecoder:
 
             for j in range(K):
                 tok_id = draft_tokens[j].item()
-                p_target_j = _get_probs(t_logits[0, j], cfg)         # (vocab,)
+                p_target_j = _get_probs(t_logits[0, j], cfg, context_ids=step_context)  # (vocab,)
                 p_draft_j = draft_probs[j]                            # (vocab,)
 
                 accept_prob = min(1.0, (p_target_j[tok_id] / (p_draft_j[tok_id] + 1e-10)).item())
@@ -299,7 +322,7 @@ class SpeculativeDecoder:
 
             if all_accepted:
                 # Bonus token from target's prediction at position L+K+1.
-                bonus_probs = _get_probs(t_logits[0, K], cfg)
+                bonus_probs = _get_probs(t_logits[0, K], cfg, context_ids=step_context)
                 bonus = _sample_from_probs(bonus_probs, cfg)
                 accepted_this_step.append(bonus)
                 stats.n_bonus += 1

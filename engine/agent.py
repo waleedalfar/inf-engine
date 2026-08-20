@@ -52,6 +52,7 @@ from engine.chat import format_messages
 from engine.sampling import SamplingConfig, sample_next_token
 from engine.tool_parser import (
     ToolCall,
+    count_tool_call_blocks,
     extract_tool_calls,
     format_tool_result,
     has_tool_call,
@@ -254,6 +255,25 @@ class AgentLoop:
                     }
                 )
 
+            # A <tool_call> block can be present but fail to parse (bad JSON).
+            # extract_tool_calls() silently drops those — without feedback the
+            # model has no idea its call never ran and will often hallucinate
+            # a success message on the next turn. Surface the failure instead.
+            n_dropped = count_tool_call_blocks(visible_text) - len(calls)
+            if n_dropped > 0:
+                history.append(
+                    {
+                        "role": "tool",
+                        "content": (
+                            f"Error: {n_dropped} tool call(s) in your last response "
+                            "could not be parsed (invalid JSON) and were NOT executed. "
+                            "Retry them now with a single well-formed <tool_call> block "
+                            "containing valid JSON."
+                        ),
+                        "name": "parser",
+                    }
+                )
+
         # Max turns reached without a clean exit.
         last_content = history[-1].get("content", "") if history else ""
         return AgentResult(
@@ -286,23 +306,28 @@ class AgentLoop:
             ids_t, cache=cache, start_pos=0, position_ids=pos_t
         )
 
-        # Sample the first generated token from the last prefill position.
-        ctx_t = ids_t                                                       # (1, T_p)
-        next_tok = sample_next_token(logits[:, -1:, :], self.sampling, ctx_t).item()
+        # Sample the first generated token. No penalty context yet — penalty
+        # is applied only to generated tokens to avoid suppressing common
+        # prompt tokens that happen to appear many times in the system prompt.
+        next_tok = sample_next_token(logits[:, -1:, :], self.sampling).item()
 
         generated: list[int] = [next_tok]
         pos = n  # the position where the first gen token lives
+        # Tracks only generated tokens for the repetition penalty.
+        gen_ctx = torch.tensor([[next_tok]], dtype=ids_t.dtype, device=device)  # (1, 1)
 
         while next_tok != self.eos_token_id and len(generated) < self.max_new_tokens:
             tok_t = torch.tensor([[next_tok]], device=device)
-            ctx_t = torch.cat([ctx_t, tok_t], dim=1)                       # (1, T_p + step)
             pos_s = torch.tensor([pos], device=device)
             logits = self.model.forward(
                 tok_t, cache=cache, start_pos=pos, position_ids=pos_s
             )
             pos += 1
-            next_tok = sample_next_token(logits[:, -1:, :], self.sampling, ctx_t).item()
+            next_tok = sample_next_token(logits[:, -1:, :], self.sampling, gen_ctx).item()
             generated.append(next_tok)
+            gen_ctx = torch.cat(
+                [gen_ctx, torch.tensor([[next_tok]], dtype=ids_t.dtype, device=device)], dim=1
+            )
 
         return generated
 

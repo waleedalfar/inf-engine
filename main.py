@@ -40,7 +40,7 @@ from engine.llama_weights import load_llama_weights
 from engine.quantize import quantize_llama, quantized_to_device
 from engine.qwen_tokenizer import QwenTokenizer
 from engine.agent import AgentLoop, Tool
-from engine.sampling import SamplingConfig, sample_next_token
+from engine.sampling import SamplingConfig, SamplingMode, sample_next_token
 from engine.speculative import SpeculativeDecoder
 
 # ---------------------------------------------------------------------------
@@ -337,11 +337,11 @@ class VerboseAgentLoop(AgentLoop):
         pos_t = torch.arange(n, device=device)
 
         logits = self.model.forward(ids_t, cache=cache, start_pos=0, position_ids=pos_t)
-        ctx_t = ids_t                                                    # (1, T_p)
-        next_tok = sample_next_token(logits[:, -1:, :], self.sampling, ctx_t).item()
+        next_tok = sample_next_token(logits[:, -1:, :], self.sampling).item()
 
         generated: list[int] = [next_tok]
         pos = n
+        gen_ctx = torch.tensor([[next_tok]], dtype=ids_t.dtype, device=device)  # (1, 1)
 
         # Reset cache stats so we measure per-generation hit rate.
         expert_cache = self._get_expert_cache()
@@ -357,12 +357,14 @@ class VerboseAgentLoop(AgentLoop):
             print(piece, end="", flush=True)
 
             tok_t = torch.tensor([[next_tok]], device=device)
-            ctx_t = torch.cat([ctx_t, tok_t], dim=1)                    # (1, T_p + step)
             pos_s = torch.tensor([pos], device=device)
             logits = self.model.forward(tok_t, cache=cache, start_pos=pos, position_ids=pos_s)
             pos += 1
-            next_tok = sample_next_token(logits[:, -1:, :], self.sampling, ctx_t).item()
+            next_tok = sample_next_token(logits[:, -1:, :], self.sampling, gen_ctx).item()
             generated.append(next_tok)
+            gen_ctx = torch.cat(
+                [gen_ctx, torch.tensor([[next_tok]], dtype=ids_t.dtype, device=device)], dim=1
+            )
 
         elapsed = time.perf_counter() - t0
         n_gen = len(generated)
@@ -653,6 +655,7 @@ def main():
         cache_factory=cache_factory,
         tools=tools,
         sampling=SamplingConfig(
+            mode=SamplingMode.TOP_P,
             temperature=0.6, top_p=0.95,
             repetition_penalty=args.repetition_penalty,
         ),

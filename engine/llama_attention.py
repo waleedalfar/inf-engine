@@ -106,18 +106,35 @@ def llama_attention(
     k_exp = repeat_kv(k, n_kv_groups)                             # (B, n_head, T_total, head_dim)
     v_exp = repeat_kv(v, n_kv_groups)                             # (B, n_head, T_total, head_dim)
 
-    # --- SDPA for all query lengths ---
-    # FlashAttention2 eliminates the O(N²) score matrix for long prefills.
-    # Using SDPA for decode (T_q=1) too so speculative decoding verify and standard
-    # decode use the same kernel — required for the correctness guarantee to hold.
-    # Note: is_causal=True with T_q=1 is equivalent to no mask (all keys allowed,
-    # since mask[0,j] = j ≤ 0 + (T_total-1) = T_total-1 → all True).
+    # --- SDPA — three cases based on T_q and cache state ---
+    #
+    # PyTorch's is_causal=True uses "upper left" masking: mask[i][j] = (j <= i).
+    # With a KV cache where T_total > T_q, this is WRONG — query i can only see
+    # keys 0..i instead of keys 0..start_pos+i.
+    #
+    # Case A — explicit mask provided (continuous batching).
+    # Case B — decode step (T_q=1): all cached keys are already from earlier
+    #           positions; is_causal=False (attend to all of them).
+    # Case C — full prefill without cached prefix (start_pos=0, T_q==T_total):
+    #           standard lower-triangular, is_causal=True is correct.
+    # Case D — multi-token forward with existing cache (spec verify phase):
+    #           query i (abs pos start_pos+i) must see keys 0..start_pos+i.
+    #           Build "upper right" offset mask: mask[i][j] = (j <= i+start_pos).
     if attn_mask is not None:
         out = F.scaled_dot_product_attention(
             q, k_exp, v_exp, attn_mask=attn_mask[:, None].bool()
         )
-    else:
+    elif T_q == 1:
+        out = F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=False)
+    elif start_pos == 0:
         out = F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=True)
+    else:
+        rows = torch.arange(T_q, device=q.device)
+        cols = torch.arange(T_total, device=q.device)
+        mask = cols[None, :] <= (rows[:, None] + start_pos)        # (T_q, T_total)
+        bias = torch.zeros(1, 1, T_q, T_total, dtype=q.dtype, device=q.device)
+        bias.masked_fill_(~mask[None, None], float("-inf"))
+        out = F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=bias)
 
     # --- merge heads and output projection ---
     out = out.transpose(1, 2).contiguous().view(B, T_q, n_head * head_dim)

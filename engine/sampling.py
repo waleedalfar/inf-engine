@@ -87,18 +87,37 @@ def sample_next_token(
     return torch.multinomial(probs, num_samples=1, generator=cfg.generator)  # (B, 1)
 
 
+_REPETITION_PENALTY_WINDOW = 256
+"""Only the last N generated tokens count toward the penalty (llama.cpp-style
+``repeat_last_n``). Code and other structured output legitimately reuses the
+same tokens (newline, indentation, ``:``, ``(``/``)``, common identifiers)
+dozens of times over a long generation; counting the entire history means
+those tokens accumulate penalty forever and eventually get suppressed enough
+to distort the whole sampling distribution, producing malformed output. A
+recency window bounds how far back repetition is tracked.
+"""
+
+
 def _apply_repetition_penalty(
     logits: torch.Tensor, context_ids: torch.Tensor, penalty: float
 ) -> torch.Tensor:
-    """Penalise logits for tokens that already appear in context_ids.
+    """Penalise logits for tokens that appear in the recent context.
 
-    Positive logits are divided by ``penalty``; negative logits are multiplied
-    by ``penalty`` — both reduce the token's probability.  Operates in-place on
-    a clone so the original tensor is not modified.
+    Flat, one-time penalty per token present in the last
+    ``_REPETITION_PENALTY_WINDOW`` tokens — matches the standard
+    llama.cpp/HF ``repetition_penalty`` semantics. Deliberately NOT scaled by
+    occurrence count: exponential frequency-weighting was tried and over-
+    suppressed legitimately-common tokens in long generations (see
+    .claude/skills/attention-causal-mask-audit for the related history — the
+    root cause of runaway repetition loops was a KV-cache attention bug, now
+    fixed, so this penalty only needs to be a light safety net).
+
+    Positive logits are divided by the penalty; negative logits are
+    multiplied — both reduce the token's probability.
 
     Args:
         logits:      (B, vocab_size)
-        context_ids: (B, T) or (T,) — all token ids seen so far.
+        context_ids: (B, T) or (T,) — token ids seen so far.
         penalty:     Factor > 1.0.
 
     Returns:
@@ -107,10 +126,12 @@ def _apply_repetition_penalty(
     logits = logits.clone()
     if context_ids.dim() == 1:
         context_ids = context_ids.unsqueeze(0).expand(logits.shape[0], -1)
+    context_ids = context_ids[:, -_REPETITION_PENALTY_WINDOW:]
+    penalty_t = torch.tensor(penalty, dtype=logits.dtype, device=logits.device)
     for b in range(logits.shape[0]):
-        ids = context_ids[b].unique()
-        score = logits[b, ids]
-        logits[b, ids] = torch.where(score < 0, score * penalty, score / penalty)
+        unique_ids = context_ids[b].unique()
+        score = logits[b, unique_ids]
+        logits[b, unique_ids] = torch.where(score < 0, score * penalty_t, score / penalty_t)
     return logits
 
 
