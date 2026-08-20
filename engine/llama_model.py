@@ -67,33 +67,87 @@ class LlamaModel:
         Returns:
             Logits over the vocabulary. Shape: (B, T_q, vocab_size)
         """
-        B, T_q = input_ids.shape
+        return self.forward_stage(
+            input_ids, 0, self.config.n_layer, True, True,
+            cache, start_pos, position_ids, attn_mask,
+        )
+
+    @torch.no_grad()
+    def forward_stage(
+        self,
+        x: torch.Tensor,
+        start_layer: int,
+        end_layer: int,
+        is_first: bool,
+        is_last: bool,
+        cache: LlamaStaticKVCache | None = None,
+        start_pos: int = 0,
+        position_ids: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run layers ``[start_layer, end_layer)`` of the model.
+
+        Splits ``forward`` at its two natural seams — the embedding lookup and
+        the final norm/lm_head — so the model can be executed as a chain of
+        stages (e.g. across a pipeline-parallel network boundary) with no
+        behavior change when run as a single stage covering every layer.
+        ``forward`` is exactly ``forward_stage(input_ids, 0, n_layer, True, True, ...)``.
+
+        Args:
+            x:            Token ids (B, T_q), dtype long, when ``is_first`` is
+                          True. Otherwise the residual stream handed off by a
+                          previous stage, shape (B, T_q, d_model).
+            start_layer:  First layer index this stage runs (inclusive).
+            end_layer:    Last layer index this stage runs (exclusive).
+            is_first:     Whether this stage owns the embedding lookup.
+            is_last:      Whether this stage owns the final norm + lm_head.
+            cache:        Optional KV cache. Only layers in
+                          ``[start_layer, end_layer)`` are touched.
+            start_pos:    Absolute position of the first token in this forward.
+            position_ids: Absolute positions for RoPE. Shape: (T_q,) or (B, T_q).
+                          Defaults to ``arange(start_pos, start_pos + T_q)``.
+            attn_mask:    Optional explicit allowed mask (B, T_q, T_total) for
+                          continuous batching; overrides causal logic when given.
+
+        Returns:
+            Logits (B, T_q, vocab_size) when ``is_last``, otherwise the
+            residual stream (B, T_q, d_model) to hand off to the next stage.
+        """
+        if is_first:
+            input_ids = x
+            B, T_q = input_ids.shape
+        else:
+            B, T_q = x.shape[0], x.shape[1]
+
         if start_pos + T_q > self.config.n_ctx:
             raise ValueError(
                 f"position {start_pos + T_q} exceeds n_ctx={self.config.n_ctx}"
             )
 
-        x = self.w.embed_tokens[input_ids]                         # (B, T_q, d_model)
+        if is_first:
+            x = self.w.embed_tokens[input_ids]                         # (B, T_q, d_model)
 
         if position_ids is None:
             position_ids = torch.arange(
-                start_pos, start_pos + T_q, device=input_ids.device
-            )                                                       # (T_q,)
+                start_pos, start_pos + T_q, device=x.device
+            )                                                           # (T_q,)
 
         # Cast RoPE tables to the weight dtype and move to the right device once.
-        cos = self.rope_cos.to(device=input_ids.device, dtype=x.dtype)
-        sin = self.rope_sin.to(device=input_ids.device, dtype=x.dtype)
+        cos = self.rope_cos.to(device=x.device, dtype=x.dtype)
+        sin = self.rope_sin.to(device=x.device, dtype=x.dtype)
 
-        for i in range(self.config.n_layer):
+        for i in range(start_layer, end_layer):
             x = llama_block(
                 x, self.w.layer(i), self.config,
                 cos, sin, position_ids,
                 cache, i, start_pos, attn_mask,
             )
 
-        x = rms_norm(x, self.w.norm_weight, self.config.norm_eps)  # (B, T_q, d_model)
-        logits = x @ self.w.lm_head.T                              # (B, T_q, vocab_size)
-        return logits
+        if is_last:
+            x = rms_norm(x, self.w.norm_weight, self.config.norm_eps)  # (B, T_q, d_model)
+            logits = x @ self.w.lm_head.T                              # (B, T_q, vocab_size)
+            return logits
+        return x
 
     @torch.no_grad()
     def generate(
