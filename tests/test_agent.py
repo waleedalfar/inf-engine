@@ -668,3 +668,45 @@ class TestGenerateToEos:
         gen_ids = loop._generate_to_eos(prompt_ids, None)
         text = loop._decode(gen_ids)
         assert "ok!" in text
+
+
+# ===========================================================================
+# Section 5 — Repetition penalty
+# ===========================================================================
+
+
+class TestRepetitionPenalty:
+    """Verify that SamplingConfig.repetition_penalty discourages already-seen tokens."""
+
+    def test_no_penalty_leaves_argmax_unchanged(self):
+        from engine.sampling import SamplingConfig, SamplingMode, sample_next_token
+        logits = torch.tensor([[0.1, 5.0, 0.2]])   # token 1 is top
+        cfg = SamplingConfig(mode=SamplingMode.GREEDY, repetition_penalty=1.0)
+        tok = sample_next_token(logits, cfg, context_ids=torch.tensor([[0, 1]]))
+        assert tok.item() == 1                     # unchanged
+
+    def test_strong_penalty_suppresses_repeated_token(self):
+        from engine.sampling import SamplingConfig, SamplingMode, sample_next_token
+        # Tokens 0 and 1 seen in context; token 2 is second-best but unseen.
+        logits = torch.tensor([[3.0, 4.0, 2.0]])   # without penalty: 1 wins
+        cfg = SamplingConfig(mode=SamplingMode.GREEDY, repetition_penalty=10.0)
+        context = torch.tensor([[0, 1]])            # tokens 0 and 1 are penalised
+        tok = sample_next_token(logits, cfg, context_ids=context)
+        assert tok.item() == 2                     # token 2 wins after heavy penalty on 0, 1
+
+    def test_negative_logit_penalised_by_multiply(self):
+        from engine.sampling import SamplingConfig, SamplingMode, sample_next_token
+        # Token 0 has a negative logit (-1.0) and is in context → multiplied by penalty
+        # → becomes -10.0.  Token 1 (0.5, not in context) wins.
+        logits = torch.tensor([[-1.0, 0.5]])
+        cfg = SamplingConfig(mode=SamplingMode.GREEDY, repetition_penalty=10.0)
+        context = torch.tensor([[0]])
+        tok = sample_next_token(logits, cfg, context_ids=context)
+        assert tok.item() == 1
+
+    def test_no_context_no_penalty(self):
+        from engine.sampling import SamplingConfig, SamplingMode, sample_next_token
+        logits = torch.tensor([[5.0, 1.0]])
+        cfg = SamplingConfig(mode=SamplingMode.GREEDY, repetition_penalty=100.0)
+        tok = sample_next_token(logits, cfg, context_ids=None)
+        assert tok.item() == 0                     # no context → no penalty applied

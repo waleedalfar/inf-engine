@@ -26,37 +26,55 @@ class SamplingConfig:
     """Decoding configuration.
 
     Attributes:
-        mode:        Which sampling rule to use.
-        temperature: Logit scaling before softmax (>0). 1.0 = unchanged.
-                     Ignored for GREEDY.
-        top_k:       Number of highest-prob tokens to keep (TOP_K only).
-        top_p:       Cumulative-probability nucleus threshold in (0, 1] (TOP_P only).
-        generator:   Optional RNG for reproducible sampling.
+        mode:               Which sampling rule to use.
+        temperature:        Logit scaling before softmax (>0). 1.0 = unchanged.
+                            Ignored for GREEDY.
+        top_k:              Number of highest-prob tokens to keep (TOP_K only).
+        top_p:              Cumulative-probability nucleus threshold in (0, 1] (TOP_P only).
+        repetition_penalty: Penalty factor > 1.0 applied to logits of tokens that have
+                            already appeared in ``context_ids``. 1.0 = no penalty.
+                            Typical values: 1.1 (mild) to 1.3 (strong). Positive logits
+                            are divided by the penalty; negative logits are multiplied
+                            (both push probability down). Applied before temperature.
+        generator:          Optional RNG for reproducible sampling.
     """
 
     mode: SamplingMode = SamplingMode.GREEDY
     temperature: float = 1.0
     top_k: int = 50
     top_p: float = 0.9
+    repetition_penalty: float = 1.0
     generator: torch.Generator | None = None
 
 
-def sample_next_token(logits: torch.Tensor, cfg: SamplingConfig) -> torch.Tensor:
+def sample_next_token(
+    logits: torch.Tensor,
+    cfg: SamplingConfig,
+    context_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Pick the next token from final-position logits.
 
     Args:
-        logits: Next-token logits. Shape: (batch, vocab_size)
-        cfg:    Decoding configuration.
+        logits:      Next-token logits. Shape: (batch, vocab_size) or (batch, 1, vocab_size).
+        cfg:         Decoding configuration.
+        context_ids: Token ids seen so far (prompt + generated). Shape: (batch, T) or (T,).
+                     Used for repetition penalty when ``cfg.repetition_penalty != 1.0``.
 
     Returns:
         Chosen token ids. Shape: (batch, 1), dtype long.
     """
+    if logits.dim() == 3:
+        logits = logits[:, -1, :]                                # (B, V)
+
+    if cfg.repetition_penalty != 1.0 and context_ids is not None:
+        logits = _apply_repetition_penalty(logits, context_ids, cfg.repetition_penalty)
+
     if cfg.mode is SamplingMode.GREEDY:
         return logits.argmax(dim=-1, keepdim=True)               # (B, 1)
 
     if cfg.temperature <= 0.0:
         raise ValueError("temperature must be > 0 for sampling modes")
-    scaled = logits / cfg.temperature                            # (B, V)
+    scaled = logits / cfg.temperature                             # (B, V)
 
     if cfg.mode is SamplingMode.TOP_K:
         filtered = _top_k_filter(scaled, cfg.top_k)              # (B, V), masked
@@ -67,6 +85,33 @@ def sample_next_token(logits: torch.Tensor, cfg: SamplingConfig) -> torch.Tensor
 
     probs = torch.softmax(filtered, dim=-1)                      # (B, V)
     return torch.multinomial(probs, num_samples=1, generator=cfg.generator)  # (B, 1)
+
+
+def _apply_repetition_penalty(
+    logits: torch.Tensor, context_ids: torch.Tensor, penalty: float
+) -> torch.Tensor:
+    """Penalise logits for tokens that already appear in context_ids.
+
+    Positive logits are divided by ``penalty``; negative logits are multiplied
+    by ``penalty`` — both reduce the token's probability.  Operates in-place on
+    a clone so the original tensor is not modified.
+
+    Args:
+        logits:      (B, vocab_size)
+        context_ids: (B, T) or (T,) — all token ids seen so far.
+        penalty:     Factor > 1.0.
+
+    Returns:
+        Penalised logits. Shape: (B, vocab_size)
+    """
+    logits = logits.clone()
+    if context_ids.dim() == 1:
+        context_ids = context_ids.unsqueeze(0).expand(logits.shape[0], -1)
+    for b in range(logits.shape[0]):
+        ids = context_ids[b].unique()
+        score = logits[b, ids]
+        logits[b, ids] = torch.where(score < 0, score * penalty, score / penalty)
+    return logits
 
 
 def _top_k_filter(logits: torch.Tensor, k: int) -> torch.Tensor:

@@ -337,7 +337,8 @@ class VerboseAgentLoop(AgentLoop):
         pos_t = torch.arange(n, device=device)
 
         logits = self.model.forward(ids_t, cache=cache, start_pos=0, position_ids=pos_t)
-        next_tok = sample_next_token(logits[:, -1:, :], self.sampling).item()
+        ctx_t = ids_t                                                    # (1, T_p)
+        next_tok = sample_next_token(logits[:, -1:, :], self.sampling, ctx_t).item()
 
         generated: list[int] = [next_tok]
         pos = n
@@ -356,10 +357,11 @@ class VerboseAgentLoop(AgentLoop):
             print(piece, end="", flush=True)
 
             tok_t = torch.tensor([[next_tok]], device=device)
+            ctx_t = torch.cat([ctx_t, tok_t], dim=1)                    # (1, T_p + step)
             pos_s = torch.tensor([pos], device=device)
             logits = self.model.forward(tok_t, cache=cache, start_pos=pos, position_ids=pos_s)
             pos += 1
-            next_tok = sample_next_token(logits[:, -1:, :], self.sampling).item()
+            next_tok = sample_next_token(logits[:, -1:, :], self.sampling, ctx_t).item()
             generated.append(next_tok)
 
         elapsed = time.perf_counter() - t0
@@ -570,6 +572,12 @@ def main():
         help="Wrap model.forward with torch.compile(mode='reduce-overhead'). "
              "First response takes ~60s to compile; subsequent calls are 10-30%% faster.",
     )
+    parser.add_argument(
+        "--repetition-penalty", type=float, default=1.1,
+        help="Repetition penalty applied to logits of already-seen tokens (default: 1.1). "
+             "1.0 = no penalty; >1.0 discourages the model from repeating itself. "
+             "Typical values: 1.05 (very mild) to 1.3 (strong).",
+    )
     parser.set_defaults(quantize=None)  # None = auto-detect based on model size
     args = parser.parse_args()
 
@@ -644,7 +652,10 @@ def main():
         tokenizer=tokenizer,
         cache_factory=cache_factory,
         tools=tools,
-        sampling=SamplingConfig(temperature=0.6, top_p=0.95),
+        sampling=SamplingConfig(
+            temperature=0.6, top_p=0.95,
+            repetition_penalty=args.repetition_penalty,
+        ),
         max_turns=args.max_turns,
         max_new_tokens=args.max_new_tokens,
         enable_thinking=args.thinking,

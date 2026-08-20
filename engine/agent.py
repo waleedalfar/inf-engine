@@ -287,19 +287,21 @@ class AgentLoop:
         )
 
         # Sample the first generated token from the last prefill position.
-        next_tok = sample_next_token(logits[:, -1:, :], self.sampling).item()
+        ctx_t = ids_t                                                       # (1, T_p)
+        next_tok = sample_next_token(logits[:, -1:, :], self.sampling, ctx_t).item()
 
         generated: list[int] = [next_tok]
         pos = n  # the position where the first gen token lives
 
         while next_tok != self.eos_token_id and len(generated) < self.max_new_tokens:
             tok_t = torch.tensor([[next_tok]], device=device)
+            ctx_t = torch.cat([ctx_t, tok_t], dim=1)                       # (1, T_p + step)
             pos_s = torch.tensor([pos], device=device)
             logits = self.model.forward(
                 tok_t, cache=cache, start_pos=pos, position_ids=pos_s
             )
             pos += 1
-            next_tok = sample_next_token(logits[:, -1:, :], self.sampling).item()
+            next_tok = sample_next_token(logits[:, -1:, :], self.sampling, ctx_t).item()
             generated.append(next_tok)
 
         return generated
