@@ -99,12 +99,26 @@ class PagedLlamaKVCache:
         manager: BlockManager,
         device: str,
         dtype: torch.dtype,
+        owned_layers: range | None = None,
     ) -> None:
+        """
+        Args:
+            owned_layers: Contiguous layer range this cache stores, e.g.
+                ``range(4, 8)`` for a pipeline stage that only owns layers
+                4-7. Defaults to every layer (``range(config.n_layer)``,
+                single-device behavior). The pool is sized to
+                ``len(owned_layers)`` layers, not ``config.n_layer`` — a
+                stage only pays VRAM for the layers it actually runs.
+                ``extend``/``extend_static`` take the model's *absolute*
+                layer index and remap it to a local pool row internally.
+        """
         self.config = config
         self.manager = manager
+        self.owned_layers = owned_layers if owned_layers is not None else range(config.n_layer)
+        self.layer_offset = self.owned_layers.start
         n_total = manager.n_total
         bs = manager.block_size
-        shape = (config.n_layer, n_total, config.n_kv_heads, bs, config.head_dim)
+        shape = (len(self.owned_layers), n_total, config.n_kv_heads, bs, config.head_dim)
         self.k_pool = torch.zeros(shape, device=device, dtype=dtype)
         self.v_pool = torch.zeros(shape, device=device, dtype=dtype)
         self.block_table: dict[int, list[int]] = {}
@@ -164,7 +178,8 @@ class PagedLlamaKVCache:
         This is called once per transformer layer by ``llama_attention``.
 
         Args:
-            layer:     Layer index.
+            layer:     Absolute model layer index (not offset by
+                       ``owned_layers`` — this cache remaps internally).
             k_new:     New keys.   Shape: (A, n_kv_heads, q_len, head_dim)
             v_new:     New values. Shape: (A, n_kv_heads, q_len, head_dim)
             start_pos: Ignored — each sequence tracks its own write position
@@ -176,6 +191,9 @@ class PagedLlamaKVCache:
             where ``max_len = max(new lengths of active sequences)``.
             Positions beyond a sequence's own length are zero.
         """
+        if layer not in self.owned_layers:
+            raise ValueError(f"layer {layer} not owned by this cache ({self.owned_layers})")
+        local_layer = layer - self.layer_offset
         A, _, q_len, _ = k_new.shape
         if A != len(self._active):
             raise RuntimeError(f"batch {A} != begin_step had {len(self._active)} seqs")
@@ -198,11 +216,13 @@ class PagedLlamaKVCache:
                 off = wrt_start - blk_start     # offset inside block
                 n_t = wrt_end - wrt_start
                 src = wrt_start - base           # index into k_new[i]
-                self.k_pool[layer, phys[b_idx], :, off : off + n_t, :] = k_new[i, :, src : src + n_t, :]
-                self.v_pool[layer, phys[b_idx], :, off : off + n_t, :] = v_new[i, :, src : src + n_t, :]
+                self.k_pool[local_layer, phys[b_idx], :, off : off + n_t, :] = k_new[i, :, src : src + n_t, :]
+                self.v_pool[local_layer, phys[b_idx], :, off : off + n_t, :] = v_new[i, :, src : src + n_t, :]
 
-        # Advance seq_lens once per full forward (after the final layer).
-        if layer == self.config.n_layer - 1:
+        # Advance seq_lens once per full forward — after the final layer this
+        # cache owns (not necessarily config.n_layer - 1: a non-last pipeline
+        # stage's cache never sees layers beyond its own owned_layers).
+        if layer == self.owned_layers[-1]:
             for i, sid in enumerate(self._active):
                 self.seq_lens[sid] = new_lens[i]
 
@@ -220,12 +240,12 @@ class PagedLlamaKVCache:
             remainder = slen % bs
             for b_idx in range(n_full):
                 dst = b_idx * bs
-                k_out[i, :, dst : dst + bs, :] = self.k_pool[layer, phys[b_idx]]
-                v_out[i, :, dst : dst + bs, :] = self.v_pool[layer, phys[b_idx]]
+                k_out[i, :, dst : dst + bs, :] = self.k_pool[local_layer, phys[b_idx]]
+                v_out[i, :, dst : dst + bs, :] = self.v_pool[local_layer, phys[b_idx]]
             if remainder:
                 dst = n_full * bs
-                k_out[i, :, dst : dst + remainder, :] = self.k_pool[layer, phys[n_full], :, :remainder, :]
-                v_out[i, :, dst : dst + remainder, :] = self.v_pool[layer, phys[n_full], :, :remainder, :]
+                k_out[i, :, dst : dst + remainder, :] = self.k_pool[local_layer, phys[n_full], :, :remainder, :]
+                v_out[i, :, dst : dst + remainder, :] = self.v_pool[local_layer, phys[n_full], :, :remainder, :]
 
         return k_out, v_out
 
@@ -307,18 +327,21 @@ class PagedLlamaKVCache:
         Returns:
             ``(k_out, v_out)``, each ``(A, n_kv_heads, capture_len, head_dim)``.
         """
+        if layer not in self.owned_layers:
+            raise ValueError(f"layer {layer} not owned by this cache ({self.owned_layers})")
+        local_layer = layer - self.layer_offset
         bs = self.manager.block_size
         block_idx = seq_lens_buf // bs                                    # (A,)
         offset = seq_lens_buf % bs                                        # (A,)
         phys = block_table_buf.gather(1, block_idx.unsqueeze(1)).squeeze(1)  # (A,)
 
-        self.k_pool[layer, phys, :, offset, :] = k_new[:, :, 0, :]
-        self.v_pool[layer, phys, :, offset, :] = v_new[:, :, 0, :]
+        self.k_pool[local_layer, phys, :, offset, :] = k_new[:, :, 0, :]
+        self.v_pool[local_layer, phys, :, offset, :] = v_new[:, :, 0, :]
 
         n_blocks_cap = capture_len // bs
         phys_all = block_table_buf[:, :n_blocks_cap]                      # (A, n_blocks_cap)
-        k_gathered = self.k_pool[layer, phys_all]      # (A, n_blocks_cap, n_kv_heads, bs, head_dim)
-        v_gathered = self.v_pool[layer, phys_all]
+        k_gathered = self.k_pool[local_layer, phys_all]      # (A, n_blocks_cap, n_kv_heads, bs, head_dim)
+        v_gathered = self.v_pool[local_layer, phys_all]
         n_kv_h, head_dim = self.config.n_kv_heads, self.config.head_dim
         k_out = k_gathered.permute(0, 2, 1, 3, 4).reshape(k_new.shape[0], n_kv_h, capture_len, head_dim)
         v_out = v_gathered.permute(0, 2, 1, 3, 4).reshape(k_new.shape[0], n_kv_h, capture_len, head_dim)
