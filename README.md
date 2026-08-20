@@ -205,8 +205,11 @@ tests/
   test_moe.py            Qwen3-MoE dispatch + expert offload
   test_agent.py          chat template + tool parser + agent loop (56 tests)
   test_phase5_kernels.py Triton kernel correctness
+  test_server.py         FastAPI HTTP server routing/streaming
+  test_cuda_graphs.py    CUDA graph decode: correctness + benchmark
 
 main.py                  interactive coding assistant (VerboseAgentLoop + tools)
+server.py                multi-session HTTP server (continuous batching, NDJSON streaming)
 ```
 
 ---
@@ -223,5 +226,6 @@ main.py                  interactive coding assistant (VerboseAgentLoop + tools)
 | 6 | Qwen3 dense + tokenizer; Qwen3-MoE + expert offload |
 | 7 | Qwen3 ChatML + agentic loop + coding assistant |
 | ✦ | Fused INT4 Triton kernel (this session) |
+| 8 | Multi-session HTTP server (continuous batching) + CUDA graphs for decode |
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) and [`ROADMAP.md`](ROADMAP.md) for deeper notes.

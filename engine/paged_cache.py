@@ -230,6 +230,101 @@ class PagedLlamaKVCache:
         return k_out, v_out
 
     # ------------------------------------------------------------------
+    # CUDA-graph-safe decode path (fixed-shape tensor gather/scatter)
+    # ------------------------------------------------------------------
+    #
+    # ``extend()`` above loops over Python ints (block ids read out of the
+    # ``block_table`` dict) — each iteration becomes a *fixed* CUDA copy
+    # kernel at graph-capture time, baked in against whatever physical
+    # block addresses happened to be active during capture. Replaying that
+    # graph against a different request's block table would read/write the
+    # wrong memory. The methods below instead address the pool via tensor
+    # *values* (gather/advanced-indexing), so a graph captured once is
+    # correct on replay against new buffer *contents* copied in before each
+    # replay — the standard approach production paged-attention engines use
+    # to make continuous batching CUDA-graph-compatible. Used only for the
+    # single-token decode step (q_len == 1); prefill keeps using extend().
+
+    def build_static_buffers(
+        self, seq_ids: list[int], bucket_size: int, capture_len: int, device: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build padded ``(block_table, seq_lens)`` tensors for one decode bucket.
+
+        Real rows mirror the live Python-side ``block_table``/``seq_lens``.
+        Padding *rows* (``bucket_size - len(seq_ids)`` of them, when fewer
+        sequences are active than the bucket's batch size) repeat the last
+        real row — those extra batch lanes do harmless redundant work and
+        their outputs are discarded by the caller. Padding *columns* (beyond
+        a sequence's currently-allocated block count, up to
+        ``capture_len // block_size``) repeat that sequence's own block 0 —
+        always a valid, allocated block; ``attn_mask`` hides the unwritten
+        positions from SDPA so their content never affects the result.
+        """
+        bs = self.manager.block_size
+        if capture_len % bs != 0:
+            raise ValueError(f"capture_len={capture_len} must be a multiple of block_size={bs}")
+        if not seq_ids:
+            raise ValueError("seq_ids must be non-empty")
+        n_blocks_cap = capture_len // bs
+
+        rows_blocks: list[list[int]] = []
+        rows_lens: list[int] = []
+        for sid in seq_ids:
+            phys = self.block_table[sid]
+            row = list(phys[:n_blocks_cap])
+            if len(row) < n_blocks_cap:
+                row += [phys[0]] * (n_blocks_cap - len(row))
+            rows_blocks.append(row)
+            rows_lens.append(self.seq_lens[sid])
+
+        while len(rows_blocks) < bucket_size:
+            rows_blocks.append(rows_blocks[-1])
+            rows_lens.append(rows_lens[-1])
+
+        block_table_buf = torch.tensor(rows_blocks, dtype=torch.long, device=device)
+        seq_lens_buf = torch.tensor(rows_lens, dtype=torch.long, device=device)
+        return block_table_buf, seq_lens_buf
+
+    def extend_static(
+        self,
+        layer: int,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        block_table_buf: torch.Tensor,
+        seq_lens_buf: torch.Tensor,
+        capture_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fixed-shape decode-step write + gather, safe to capture in a CUDA graph.
+
+        Args:
+            k_new, v_new:    New keys/values for the single new decode token.
+                             Shape: (A, n_kv_heads, 1, head_dim)
+            block_table_buf: (A, capture_len // block_size) physical block ids.
+            seq_lens_buf:    (A,) each row's token count *before* this write.
+            capture_len:     Fixed gather length for this bucket (a multiple
+                             of block_size).
+
+        Returns:
+            ``(k_out, v_out)``, each ``(A, n_kv_heads, capture_len, head_dim)``.
+        """
+        bs = self.manager.block_size
+        block_idx = seq_lens_buf // bs                                    # (A,)
+        offset = seq_lens_buf % bs                                        # (A,)
+        phys = block_table_buf.gather(1, block_idx.unsqueeze(1)).squeeze(1)  # (A,)
+
+        self.k_pool[layer, phys, :, offset, :] = k_new[:, :, 0, :]
+        self.v_pool[layer, phys, :, offset, :] = v_new[:, :, 0, :]
+
+        n_blocks_cap = capture_len // bs
+        phys_all = block_table_buf[:, :n_blocks_cap]                      # (A, n_blocks_cap)
+        k_gathered = self.k_pool[layer, phys_all]      # (A, n_blocks_cap, n_kv_heads, bs, head_dim)
+        v_gathered = self.v_pool[layer, phys_all]
+        n_kv_h, head_dim = self.config.n_kv_heads, self.config.head_dim
+        k_out = k_gathered.permute(0, 2, 1, 3, 4).reshape(k_new.shape[0], n_kv_h, capture_len, head_dim)
+        v_out = v_gathered.permute(0, 2, 1, 3, 4).reshape(k_new.shape[0], n_kv_h, capture_len, head_dim)
+        return k_out, v_out
+
+    # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
 

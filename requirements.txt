@@ -11,6 +11,10 @@ numpy
 # Plotting / benchmarking
 matplotlib
 
+# server.py — multi-session HTTP server (not imported by engine/)
+fastapi
+uvicorn[standard]
+
 # Dev / test ONLY — transformers is used solely as the correctness oracle in tests/
 # and is never imported by the engine/ package.
 transformers

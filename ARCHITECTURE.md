@@ -8,9 +8,10 @@ The engine is a pure-function transformer stack: every forward pass is a determi
 of token ids and loaded weights. There is no `nn.Module` graph, no hidden state, and no framework
 abstraction layer. The only mutable state — the KV cache — is layered on top explicitly.
 
-The engine started as a GPT-2 implementation and was extended through six phases to support
+The engine started as a GPT-2 implementation and was extended through eight phases to support
 LLaMA-family dense models, Qwen3 (dense + MoE), INT4 quantization, paged memory, speculative
-decoding, and (Phase 7) a full agentic loop with structured tool calling.
+decoding, a full agentic loop with structured tool calling (Phase 7), and (Phase 8) a
+multi-session HTTP server with CUDA-graph-accelerated decode.
 
 ---
 
@@ -82,13 +83,20 @@ text ──► QwenTokenizer / GPT2Tokenizer ──► input_ids (B, T)
 | `engine/speculative.py` | `SpeculativeDecoder` + `SpecStats` — draft K tokens → verify K+1 in one target pass |
 | `engine/moe_offload.py` | `ExpertOffloadManager` — pinned CPU expert tensors, sync VRAM fetch per token |
 
-### Agentic layer (Phase 7 — planned)
+### Agentic layer (Phase 7)
 
 | File | Responsibility |
 |---|---|
 | `engine/chat.py` | `format_messages(messages, tools)` — OpenAI-style dict list → Qwen3 ChatML string |
 | `engine/tool_parser.py` | `extract_tool_calls`, `has_tool_call`, `format_tool_result` — `<tool_call>` JSON parsing |
 | `engine/agent.py` | `AgentLoop`, `Tool`, `AgentResult` — multi-turn generate → parse → execute → inject loop |
+
+### Multi-session serving (Phase 8)
+
+| File | Responsibility |
+|---|---|
+| `engine/paged_session.py` | `Session`, `PagedSessionManager` — per-session ChatML history + tool loop driven by the shared `LlamaPagedEngine`; `run_forever` owns the engine on one background thread |
+| `server.py` | FastAPI app (outside `engine/` — not imported by it): `POST /v1/chat` (NDJSON streaming), `GET /healthz` |
 
 ---
 
@@ -105,6 +113,16 @@ Simple but wasteful — each sequence reserves `max_seq` slots from the start.
 **Paged cache** (`PagedLlamaKVCache`): `BlockManager` manages a pool of fixed-size physical blocks
 (e.g., 16 tokens each). Each sequence gets only the blocks it actually uses; blocks return to the
 pool the moment a sequence completes. ≤1 block/sequence fragmentation vs full `max_seq` waste.
+
+**CUDA-graph-safe decode path** (`build_static_buffers` / `extend_static`, Phase 8): the normal
+`extend()` above loops over Python ints read out of the `block_table` dict — each iteration
+becomes a *fixed* CUDA copy kernel baked in against whatever physical addresses were active at
+capture time, so a captured graph replaying it against a different block table (or a different
+active-session set — the norm under continuous batching) would corrupt memory. `extend_static`
+instead addresses the pool via tensor *values* (`gather` / advanced indexing computed at
+kernel-launch time), so a graph captured once against a `(block_table_buf, seq_lens_buf)` pair
+stays correct when those buffers' *contents* are overwritten (`.copy_()`) before each replay.
+Used only for the single-token decode step; prefill keeps using `extend()`.
 
 ---
 
@@ -170,6 +188,45 @@ This is critical for long agentic sessions — re-encoding the full history each
 
 **Tool schema:** each `Tool` carries a JSON Schema `parameters` dict injected into the system prompt
 by `format_messages`, so Qwen3 knows what arguments to pass.
+
+---
+
+## Multi-session serving + CUDA graphs (Phase 8)
+
+`server.py` puts one `LlamaPagedEngine` behind a FastAPI app so many concurrent HTTP
+conversations share the same GPU's decode steps, instead of `main.py`'s `AgentLoop` running
+one session at a time. A single background thread owns the engine and paged cache
+(`PagedSessionManager.run_forever`); HTTP handlers only ever call the thread-safe
+`.submit(session_id, messages, emit)`, which hands the request off via `queue.SimpleQueue` and
+streams events back out through an `emit()` callback wrapped in `loop.call_soon_threadsafe` so
+results land on the right asyncio event loop. `POST /v1/chat` streams NDJSON
+(`token` / `tool_exec` / `done` / `error` events).
+
+```
+HTTP request ──► ChatRequest ──► PagedSessionManager.submit(session_id, messages, emit)
+                                          │  (queue.SimpleQueue hand-off)
+                              engine thread: run_forever loop
+                                          │  Session.step() drives LlamaPagedEngine.step()
+                                          │  ADMIT → DECODE (batched across ALL active sessions) → EVICT
+                                          │  emit(event) per token / tool call / completion
+                              loop.call_soon_threadsafe(events.put_nowait, event)
+                                          │
+                              StreamingResponse ──► NDJSON lines back to the client
+```
+
+**CUDA graphs for decode** (`LlamaPagedEngine(..., enable_cuda_graphs=True)`, off by default,
+no-op off CUDA): captures and replays a `torch.cuda.CUDAGraph` for the single-token decode
+step instead of an eager forward. Continuous batching means the decode step's shape (active
+batch size, per-sequence KV length) changes every step, but CUDA graphs need *fixed* shapes —
+so the engine buckets both dimensions (batch size: powers of two up to 64; KV-gather length:
+block-size-aligned power-of-two multiples up to `n_ctx`) and lazily captures one graph per
+`(batch_bucket, len_bucket)` pair on first use. Before each replay, fresh
+`(input_ids, position_ids, block_table_buf, seq_lens_buf, attn_mask)` tensors are built from the
+real active sessions and `.copy_()`'d into the graph's static buffers — the graph itself only
+ever sees the same tensor *objects*, never new ones, which is what makes replay legal. A step
+whose shape doesn't fit any configured bucket (e.g. a sequence longer than the largest length
+bucket) falls back to the eager decode path automatically. See `paged_cache.py`'s
+"CUDA-graph-safe decode path" section above for the KV-cache half of this.
 
 ---
 

@@ -1,3 +1,10 @@
+# CLI Reference
+
+This project has two entry points: `main.py` for a single interactive session in your
+terminal, and `server.py` for serving many concurrent sessions over HTTP with continuous
+batching. See [`main.py`](#cli-reference--mainpy) below, or jump to
+[`server.py`](#cli-reference--serverpy).
+
 # CLI Reference — `main.py`
 
 ```
@@ -132,3 +139,60 @@ python main.py --model-dir weights/Qwen--Qwen3-8B \
 # Review what you asked the model last week
 python main.py --show-history 10
 ```
+
+---
+
+# CLI Reference — `server.py`
+
+```
+python server.py --model-dir PATH [OPTIONS]
+```
+
+Multi-session HTTP server. One loaded model, one background "engine thread" running
+`LlamaPagedEngine` with continuous batching (`engine/paged_session.py`) — concurrent HTTP
+conversations get their decode steps batched together instead of running one-at-a-time like
+`main.py`'s single-session `AgentLoop`.
+
+## Required
+
+| Flag | Description |
+|------|-------------|
+| `--model-dir PATH` | Directory containing model weights and tokenizer (same requirement as `main.py`). |
+
+## Model & inference
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--workspace PATH` | `.` | Root directory tools can read/write/run in (sandboxed, shared by all sessions). |
+| `--host` | `0.0.0.0` | Bind address. |
+| `--port` | `8000` | Bind port. |
+| `--device {cuda,cpu}` | `cuda` if available | Device to run inference on. |
+| `--quantize` / `--no-quantize` | auto | Same auto-detect/override behavior as `main.py`'s flags. |
+| `--max-ctx N` | `8192` | Per-session context budget in tokens. |
+| `--max-new-tokens N` | `1024` | Max tokens generated per agent turn, per session. |
+| `--max-turns N` | `8` | Max tool-call iterations per user message before a session gives up. |
+| `--thinking` | off | Enable Qwen3 `<think>` blocks. |
+| `--repetition-penalty N` | `1.1` | Same as `main.py`'s flag. |
+
+## KV pool (shared across all concurrent sessions)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--n-total-blocks N` | `4096` | Physical KV blocks in the pool. With the default `--block-size`, that's 65536 tokens of total capacity shared across every active session. |
+| `--block-size N` | `16` | Tokens per physical block. |
+
+```bash
+python server.py --model-dir weights/Qwen--Qwen3-8B --port 8000
+
+curl -N -X POST http://localhost:8000/v1/chat \
+    -H "Content-Type: application/json" \
+    -d '{"messages": [{"role": "user", "content": "list the files here"}]}'
+```
+
+Response body is NDJSON (one JSON object per line): a `session` event first (echoes the
+session id — pass it back as `"session_id"` in a follow-up request to continue the
+conversation), then `token` events as text streams in, then either a terminal `done` or
+`error` event.
+
+`GET /healthz` returns `{"status": "loading"}` before the model finishes loading, then
+`{"status": "ok", "active_sessions": N}`.

@@ -92,6 +92,67 @@ def _truncate_history(
     return sys_msgs + convo
 
 
+def _execute_tool(call: ToolCall, tools: dict[str, "Tool"]) -> str:
+    """Dispatch a parsed tool call against *tools* and return a result string.
+
+    Unknown tool names and runtime exceptions both produce an error string
+    that is fed back to the model as the tool result — this function never
+    raises, a bad tool call becomes model-visible feedback instead.
+    """
+    if call.name not in tools:
+        available = ", ".join(tools.keys()) or "<none>"
+        return f"Error: unknown tool '{call.name}'. Available: {available}"
+    try:
+        result = tools[call.name].fn(**call.arguments)
+        return format_tool_result(call.name, result)
+    except Exception as exc:  # noqa: BLE001
+        return f"Error: {type(exc).__name__}: {exc}"
+
+
+def dispatch_tool_calls(
+    visible_text: str,
+    raw_text: str,
+    history: list[dict],
+    tools: dict[str, "Tool"],
+) -> tuple[list[dict], list[ToolCall]]:
+    """Parse ``<tool_call>`` blocks in *visible_text*, execute them, and append
+    the assistant turn plus every tool result (and any dropped-call error) to
+    *history*. Shared by :class:`AgentLoop` (single-session CLI) and the
+    paged-engine session driver so both drive the exact same tool-calling
+    semantics.
+
+    Returns ``(updated_history, calls_dispatched)``. Does not mutate *history*
+    in place — returns a new list.
+    """
+    history = list(history) + [{"role": "assistant", "content": raw_text}]
+    calls = extract_tool_calls(visible_text)
+
+    for call in calls:
+        result_str = _execute_tool(call, tools)
+        history.append({"role": "tool", "content": result_str, "name": call.name})
+
+    # A <tool_call> block can be present but fail to parse (bad JSON).
+    # extract_tool_calls() silently drops those — without feedback the
+    # model has no idea its call never ran and will often hallucinate
+    # a success message on the next turn. Surface the failure instead.
+    n_dropped = count_tool_call_blocks(visible_text) - len(calls)
+    if n_dropped > 0:
+        history.append(
+            {
+                "role": "tool",
+                "content": (
+                    f"Error: {n_dropped} tool call(s) in your last response "
+                    "could not be parsed (invalid JSON) and were NOT executed. "
+                    "Retry them now with a single well-formed <tool_call> block "
+                    "containing valid JSON."
+                ),
+                "name": "parser",
+            }
+        )
+
+    return history, calls
+
+
 @dataclass
 class Tool:
     """A Python function exposed to the model as a callable tool.
@@ -241,38 +302,8 @@ class AgentLoop:
                 )
 
             # Tool call(s) present — dispatch and inject results.
-            calls = extract_tool_calls(visible_text)
-            history.append({"role": "assistant", "content": raw_text})
-
-            for call in calls:
-                all_tool_calls.append(call)
-                result_str = self._execute_tool(call)
-                history.append(
-                    {
-                        "role": "tool",
-                        "content": result_str,
-                        "name": call.name,
-                    }
-                )
-
-            # A <tool_call> block can be present but fail to parse (bad JSON).
-            # extract_tool_calls() silently drops those — without feedback the
-            # model has no idea its call never ran and will often hallucinate
-            # a success message on the next turn. Surface the failure instead.
-            n_dropped = count_tool_call_blocks(visible_text) - len(calls)
-            if n_dropped > 0:
-                history.append(
-                    {
-                        "role": "tool",
-                        "content": (
-                            f"Error: {n_dropped} tool call(s) in your last response "
-                            "could not be parsed (invalid JSON) and were NOT executed. "
-                            "Retry them now with a single well-formed <tool_call> block "
-                            "containing valid JSON."
-                        ),
-                        "name": "parser",
-                    }
-                )
+            history, calls = dispatch_tool_calls(visible_text, raw_text, history, self.tools)
+            all_tool_calls.extend(calls)
 
         # Max turns reached without a clean exit.
         last_content = history[-1].get("content", "") if history else ""
@@ -340,15 +371,8 @@ class AgentLoop:
     def _execute_tool(self, call: ToolCall) -> str:
         """Dispatch a parsed tool call and return a result string.
 
-        Unknown tool names and runtime exceptions both produce an error
-        string that is fed back to the model as the tool result.  The loop
-        never raises — a bad tool call becomes model-visible feedback.
+        Kept as a thin instance-method wrapper around the shared
+        :func:`_execute_tool` free function for backward compatibility with
+        callers/tests that monkey-patch or call ``loop._execute_tool``.
         """
-        if call.name not in self.tools:
-            available = ", ".join(self.tools.keys()) or "<none>"
-            return f"Error: unknown tool '{call.name}'. Available: {available}"
-        try:
-            result = self.tools[call.name].fn(**call.arguments)
-            return format_tool_result(call.name, result)
-        except Exception as exc:  # noqa: BLE001
-            return f"Error: {type(exc).__name__}: {exc}"
+        return _execute_tool(call, self.tools)
