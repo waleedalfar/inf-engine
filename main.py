@@ -30,7 +30,7 @@ from engine.kv_cache import LlamaStaticKVCache
 from engine.llama_model import LlamaModel
 from engine.llama_moe_model import load_moe_weights, load_moe_weights_disk
 from engine.llama_weights import load_llama_weights
-from engine.quantize import quantize_llama
+from engine.quantize import quantize_llama, quantized_to_device
 from engine.qwen_tokenizer import QwenTokenizer
 from engine.agent import AgentLoop, Tool
 from engine.sampling import SamplingConfig, sample_next_token
@@ -331,13 +331,25 @@ def load_model(
             print(f"MoE model — disk expert offload ({cache_mb:.0f} MB VRAM expert cache)")
             model = load_moe_weights_disk(model_dir, config, device=device, dtype=dtype, cache_mb=cache_mb)
     else:
-        weights = load_llama_weights(model_dir, config, device=device, dtype=dtype)
-        model = LlamaModel(weights, config)
-        if quantize:
-            print("Quantizing to INT4 W4A16 ...")
+        if quantize and device == "cuda":
+            # Load to CPU first: bf16 14B = ~28 GB which exceeds 16 GB VRAM.
+            # Quantize on CPU (→ ~7 GB INT4), then move compressed weights to GPU.
+            print("Loading to CPU for quantization (avoids VRAM OOM on 14B+) ...")
+            weights = load_llama_weights(model_dir, config, device="cpu", dtype=dtype)
+            model = LlamaModel(weights, config)
+            print("Quantizing to INT4 W4A16 on CPU ...")
             model = quantize_llama(model)
+            print(f"Moving INT4 weights to {device} ...")
+            model = quantized_to_device(model, device)
+        else:
+            weights = load_llama_weights(model_dir, config, device=device, dtype=dtype)
+            model = LlamaModel(weights, config)
+            if quantize:
+                print("Quantizing to INT4 W4A16 ...")
+                model = quantize_llama(model)
+        if quantize:
             vram = torch.cuda.memory_allocated() / 1e9 if device == "cuda" else 0
-            print(f"Quantization done — {vram:.1f} GB VRAM in use (bf16 originals freed)")
+            print(f"Quantization done — {vram:.1f} GB VRAM in use")
     print(f"Model ready: {config.name} on {device}")
     return model
 

@@ -224,3 +224,30 @@ def quantize_llama(
     q_model.rope_cos = model.rope_cos
     q_model.rope_sin = model.rope_sin
     return q_model
+
+
+def quantized_to_device(model: LlamaModel, device: str) -> LlamaModel:
+    """Move a quantized LlamaModel's tensors to ``device`` in-place.
+
+    Use this after quantizing on CPU so the full bf16 weights never touch VRAM.
+    Typical flow for 14B on a 16 GB GPU:
+        load bf16 to CPU (~28 GB RAM) → quantize on CPU → move INT4 to VRAM (~7 GB)
+    """
+    w = model.w
+    if not isinstance(w, QuantizedLlamaWeights):
+        raise TypeError("quantized_to_device requires a model from quantize_llama()")
+
+    for k in list(w._orig._t.keys()):
+        w._orig._t[k] = w._orig._t[k].to(device)
+
+    for w4 in w._int4.values():
+        w4.packed = w4.packed.to(device)
+        w4.scale = w4.scale.to(device)
+
+    model.rope_cos = model.rope_cos.to(device)
+    model.rope_sin = model.rope_sin.to(device)
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return model
