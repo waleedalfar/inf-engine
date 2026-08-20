@@ -378,9 +378,15 @@ def main():
         "--thinking", action="store_true",
         help="Enable Qwen3 chain-of-thought (<think> blocks). Off by default for speed.",
     )
-    parser.add_argument(
-        "--quantize", action="store_true",
-        help="Quantize weights to INT4 after loading (required for 8B+ on 16 GB GPU).",
+    quant_group = parser.add_mutually_exclusive_group()
+    quant_group.add_argument(
+        "--quantize", dest="quantize", action="store_const", const=True,
+        help="Quantize weights to INT4 W4A16 after loading. "
+             "Auto-enabled for dense models with d_model >= 4096 (8B, 14B, 32B).",
+    )
+    quant_group.add_argument(
+        "--no-quantize", dest="quantize", action="store_const", const=False,
+        help="Disable INT4 quantization even for large models.",
     )
     parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu",
@@ -397,6 +403,7 @@ def main():
              "'ram' loads all experts into pinned CPU RAM (needs ~57 GB for 30B-A3B). "
              "Default: disk.",
     )
+    parser.set_defaults(quantize=None)  # None = auto-detect based on model size
     args = parser.parse_args()
 
     try:
@@ -410,6 +417,14 @@ def main():
 
     dtype = torch.bfloat16
     config = detect_config(args.model_dir)
+
+    # Auto-enable quantize for large dense models (8B, 14B, 32B) if not explicitly set.
+    if args.quantize is None:
+        args.quantize = not config.is_moe and config.d_model >= 4096
+        if args.quantize:
+            print(f"Auto-enabling INT4 quantization for {config.name} "
+                  f"(d_model={config.d_model}). Pass --no-quantize to disable.")
+
     tokenizer = QwenTokenizer(args.model_dir)
     model = load_model(
         args.model_dir, config, args.device, dtype,

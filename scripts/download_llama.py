@@ -1,13 +1,20 @@
-"""Download LLaMA safetensors weights from the HuggingFace Hub into weights/.
+"""Download LLaMA / Qwen3 safetensors weights from the HuggingFace Hub into weights/.
 
 Requires:
   - A HuggingFace account with access granted to the model repo.
   - Being logged in: run  huggingface-cli login  before this script.
 
 Usage:
-    python scripts/download_llama.py                     # LLaMA 3.2 1B (default)
-    python scripts/download_llama.py meta-llama/Llama-3.2-3B
-    python scripts/download_llama.py meta-llama/Meta-Llama-3-8B
+    python scripts/download_llama.py                     # Qwen3-14B (default)
+    python scripts/download_llama.py qwen3-8b
+    python scripts/download_llama.py qwen3-30b-a3b
+    python scripts/download_llama.py Qwen/Qwen3-4B       # full HF repo id also works
+
+Shorthand names (case-insensitive):
+    qwen3-0.6b   qwen3-1.7b   qwen3-4b    qwen3-8b
+    qwen3-14b    qwen3-32b    qwen3-30b-a3b
+    smollm2-1.7b
+    llama-3.2-1b  llama-3.2-3b  llama-3-8b
 """
 
 from __future__ import annotations
@@ -27,9 +34,30 @@ _IGNORE = [
     "tokenizer.model",  # we use HF tokenizer, not sentencepiece
 ]
 
+# Shorthand name → HuggingFace repo id.
+KNOWN_MODELS: dict[str, str] = {
+    "qwen3-0.6b":    "Qwen/Qwen3-0.6B",
+    "qwen3-1.7b":    "Qwen/Qwen3-1.7B",
+    "qwen3-4b":      "Qwen/Qwen3-4B",
+    "qwen3-8b":      "Qwen/Qwen3-8B",
+    "qwen3-14b":     "Qwen/Qwen3-14B",
+    "qwen3-32b":     "Qwen/Qwen3-32B",
+    "qwen3-30b-a3b": "Qwen/Qwen3-30B-A3B",
+    "smollm2-1.7b":  "HuggingFaceTB/SmolLM2-1.7B",
+    "llama-3.2-1b":  "meta-llama/Llama-3.2-1B",
+    "llama-3.2-3b":  "meta-llama/Llama-3.2-3B",
+    "llama-3-8b":    "meta-llama/Meta-Llama-3-8B",
+}
 
-def download(repo_id: str) -> Path:
-    """Download all safetensors (and config/tokenizer) files for ``repo_id``."""
+
+def resolve(name: str) -> str:
+    """Return a full HF repo id, resolving shorthand names."""
+    return KNOWN_MODELS.get(name.lower(), name)
+
+
+def download(name: str) -> Path:
+    """Download all safetensors (and config/tokenizer) files for ``name``."""
+    repo_id = resolve(name)
     target_dir = WEIGHTS_DIR / repo_id.replace("/", "--")
     target_dir.mkdir(parents=True, exist_ok=True)
     print(f"[{repo_id}] downloading into {target_dir} ...", flush=True)
@@ -44,9 +72,6 @@ def download(repo_id: str) -> Path:
 
 
 if __name__ == "__main__":
-    # Default: SmolLM2-1.7B (Apache 2.0, no login required).
-    # Pass a model id to download a different one:
-    #   python scripts/download_llama.py meta-llama/Llama-3.2-1B
-    models = sys.argv[1:] or ["HuggingFaceTB/SmolLM2-1.7B"]
-    for m in models:
-        download(m)
+    names = sys.argv[1:] or ["qwen3-14b"]
+    for n in names:
+        download(n)
