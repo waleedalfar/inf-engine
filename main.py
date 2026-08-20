@@ -331,10 +331,11 @@ def load_model(
             print(f"MoE model — disk expert offload ({cache_mb:.0f} MB VRAM expert cache)")
             model = load_moe_weights_disk(model_dir, config, device=device, dtype=dtype, cache_mb=cache_mb)
     else:
-        if quantize and device == "cuda":
-            # Load to CPU first: bf16 14B = ~28 GB which exceeds 16 GB VRAM.
-            # Quantize on CPU (→ ~7 GB INT4), then move compressed weights to GPU.
-            print("Loading to CPU for quantization (avoids VRAM OOM on 14B+) ...")
+        # 14B+ in bf16 exceeds 16 GB VRAM — load to CPU, quantize there, move INT4 to GPU.
+        # 8B in bf16 (~16 GB) fits and quantizes faster directly on the GPU.
+        cpu_first = quantize and device == "cuda" and config.d_model > 4096
+        if cpu_first:
+            print("Loading to CPU for quantization (bf16 too large for VRAM on 14B+) ...")
             weights = load_llama_weights(model_dir, config, device="cpu", dtype=dtype)
             model = LlamaModel(weights, config)
             print("Quantizing to INT4 W4A16 on CPU ...")
