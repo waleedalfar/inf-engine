@@ -16,9 +16,8 @@ Three differences from the GPT-2 attention (engine/attention.py):
 
 from __future__ import annotations
 
-import math
-
 import torch
+import torch.nn.functional as F
 
 from engine.config import LlamaConfig
 from engine.kv_cache import LlamaStaticKVCache
@@ -107,21 +106,18 @@ def llama_attention(
     k_exp = repeat_kv(k, n_kv_groups)                             # (B, n_head, T_total, head_dim)
     v_exp = repeat_kv(v, n_kv_groups)                             # (B, n_head, T_total, head_dim)
 
-    # --- scaled dot-product scores ---
-    scale = 1.0 / math.sqrt(head_dim)
-    scores = (q @ k_exp.transpose(-2, -1)) * scale                # (B, n_head, T_q, T_total)
-
-    # --- causal mask ---
+    # --- SDPA for all query lengths ---
+    # FlashAttention2 eliminates the O(N²) score matrix for long prefills.
+    # Using SDPA for decode (T_q=1) too so speculative decoding verify and standard
+    # decode use the same kernel — required for the correctness guarantee to hold.
+    # Note: is_causal=True with T_q=1 is equivalent to no mask (all keys allowed,
+    # since mask[0,j] = j ≤ 0 + (T_total-1) = T_total-1 → all True).
     if attn_mask is not None:
-        scores = scores.masked_fill(~attn_mask[:, None].bool(), float("-inf"))
+        out = F.scaled_dot_product_attention(
+            q, k_exp, v_exp, attn_mask=attn_mask[:, None].bool()
+        )
     else:
-        q_abs = torch.arange(T_q, device=x.device) + start_pos    # (T_q,)
-        k_abs = torch.arange(T_total, device=x.device)            # (T_total,)
-        allowed = k_abs[None, :] <= q_abs[:, None]                # (T_q, T_total)
-        scores = scores.masked_fill(~allowed, float("-inf"))
-
-    attn = torch.softmax(scores, dim=-1)                          # (B, n_head, T_q, T_total)
-    out = attn @ v_exp                                            # (B, n_head, T_q, head_dim)
+        out = F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=True)
 
     # --- merge heads and output projection ---
     out = out.transpose(1, 2).contiguous().view(B, T_q, n_head * head_dim)

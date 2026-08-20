@@ -565,6 +565,11 @@ def main():
         "--show-history", metavar="N", nargs="?", const=0, type=int,
         help="Print past sessions and exit. Optionally pass N to show only the last N sessions.",
     )
+    parser.add_argument(
+        "--compile", action="store_true",
+        help="Wrap model.forward with torch.compile(mode='reduce-overhead'). "
+             "First response takes ~60s to compile; subsequent calls are 10-30%% faster.",
+    )
     parser.set_defaults(quantize=None)  # None = auto-detect based on model size
     args = parser.parse_args()
 
@@ -604,6 +609,10 @@ def main():
         expert_offload=args.expert_offload,
         cache_mb=args.cache_mb,
     )
+    if args.compile:
+        print("Compiling model (one-time, ~60s) ...")
+        model.forward = torch.compile(model.forward, mode="reduce-overhead", fullgraph=False)
+
     cache_factory = make_cache_factory(config, args.device, dtype, max_seq=args.max_ctx)
 
     # Optional speculative decoding: load a small draft model.

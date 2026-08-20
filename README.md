@@ -46,6 +46,18 @@ Packing layout: `packed[k//2, n]` encodes two int4 weights per byte (high nibble
 even row, low nibble = odd row). Decode uses arithmetic right-shift sign extension:
 `high = p >> 4`, `low = ((p & 0x0F).to(int8) << 4) >> 4`.
 
+### FlashAttention2 prefill (SDPA)
+
+`engine/llama_attention.py` dispatches all attention through `F.scaled_dot_product_attention`,
+which selects FlashAttention2 on sm_80+ GPUs. FA2 eliminates the O(N²) score matrix:
+at 8K context, the naive score tensor is `8192² × 32 heads × 2 bytes ≈ 4 GB` — FA2
+uses O(N) HBM instead. Single-token decode also goes through SDPA (FA2 decode mode),
+ensuring speculative decoding's verify and decode steps use the same kernel, preserving
+the mathematical correctness guarantee.
+
+Add `--compile` to wrap `model.forward` with `torch.compile(mode='reduce-overhead')`
+for an additional 10–30% decode speedup after a one-time ~60s compilation.
+
 ### Paged KV cache
 
 `PagedLlamaKVCache` allocates KV memory in fixed-size blocks (like virtual memory pages)

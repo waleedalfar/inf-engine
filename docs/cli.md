@@ -27,6 +27,7 @@ calls tools (read/write/run) autonomously, and saves each session to a history f
 | `--max-new-tokens N` | `1024` | Maximum tokens the model may generate per agent turn. Includes tool-call responses. |
 | `--max-ctx N` | `8192` | KV cache size in tokens. Qwen3 supports up to 32768. Larger values use more VRAM (~0.5 GB per 4096 tokens for Qwen3-8B INT4). When a conversation exceeds this, the oldest turns are silently dropped. |
 | `--thinking` | off | Enable Qwen3 chain-of-thought (`<think>` blocks). Produces more accurate answers at the cost of extra tokens and latency. Off by default. |
+| `--compile` | off | Wrap `model.forward` with `torch.compile(mode='reduce-overhead')`. The first response takes ~60s to compile; subsequent calls are 10–30% faster. Recommended for long interactive sessions. |
 
 ---
 
