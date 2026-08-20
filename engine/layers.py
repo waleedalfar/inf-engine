@@ -1,63 +1,11 @@
-"""Primitive layers implemented from scratch: LayerNorm, GELU, Conv1D-style linear.
+"""Primitive layers for the Qwen3 / LLaMA inference engine.
 
-These are deliberately not ``torch.nn`` modules — they are pure functions over
-tensors so the forward pass reads as explicit math with named-dimension shape
-comments.
+Pure tensor functions (not nn.Module) so forward-pass code reads as explicit math.
 """
 
 from __future__ import annotations
 
-import math
-
 import torch
-
-# GPT-2 uses the "tanh" GELU approximation (a.k.a. ``gelu_new``). The exact-erf
-# GELU produces slightly different activations and would break the token-for-token
-# correctness gate, so the constant below is part of the contract, not a tweakable.
-_GELU_COEF = 0.044715
-_SQRT_2_OVER_PI = math.sqrt(2.0 / math.pi)
-
-
-def layer_norm(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    """Layer normalization over the last dimension (implemented manually).
-
-    Normalizes each length-``d_model`` vector to zero mean / unit variance, then
-    applies a learned affine transform. Variance is the **biased** estimator
-    (divide by d_model, not d_model-1), matching ``torch.nn.LayerNorm``.
-
-    Args:
-        x:      Input.  Shape: (..., d_model)
-        weight: Affine gain.  Shape: (d_model,)
-        bias:   Affine shift. Shape: (d_model,)
-        eps:    Added to variance before sqrt for numerical stability.
-
-    Returns:
-        Normalized tensor. Shape: (..., d_model)
-    """
-    mean = x.mean(dim=-1, keepdim=True)                      # (..., 1)
-    var = x.var(dim=-1, unbiased=False, keepdim=True)        # (..., 1) biased variance
-    x_hat = (x - mean) / torch.sqrt(var + eps)               # (..., d_model)
-    return x_hat * weight + bias                             # (..., d_model) broadcast affine
-
-
-def gelu(x: torch.Tensor) -> torch.Tensor:
-    """GELU activation, tanh approximation (``gelu_new``, as used by GPT-2).
-
-    gelu(x) = 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 * x^3) ))
-
-    Args:
-        x: Input of any shape.
-
-    Returns:
-        Activated tensor, same shape as ``x``.
-    """
-    inner = _SQRT_2_OVER_PI * (x + _GELU_COEF * x.pow(3))    # same shape as x
-    return 0.5 * x * (1.0 + torch.tanh(inner))               # same shape as x
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -82,19 +30,24 @@ def silu(x: torch.Tensor) -> torch.Tensor:
     return x * torch.sigmoid(x)
 
 
-def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Standard nn.Linear projection: y = x @ W^T. Weight stored as (d_out, d_in).
+def linear(x: torch.Tensor, weight) -> torch.Tensor:
+    """LLaMA linear projection: y = x @ W^T, with INT4 fused-kernel dispatch.
 
-    LLaMA uses nn.Linear (opposite transpose convention from GPT-2's Conv1D).
+    If ``weight`` is an ``_Int4Weight`` (from quantize.py), delegates to its
+    ``fused_linear`` method, which unpacks nibbles inside a Triton kernel without
+    writing an intermediate bf16 tensor to HBM.  Otherwise falls back to the
+    standard ``x @ weight.T`` path.
 
     Args:
         x:      Input. Shape: (..., d_in)
-        weight: Stored as (d_out, d_in).
+        weight: (d_out, d_in) tensor, or an ``_Int4Weight`` object.
 
     Returns:
         Projected tensor. Shape: (..., d_out)
     """
-    return x @ weight.T                                            # (..., d_in) @ (d_in, d_out)
+    if hasattr(weight, "fused_linear"):
+        return weight.fused_linear(x)
+    return x @ weight.T
 
 
 # ---------------------------------------------------------------------------
@@ -162,18 +115,3 @@ def apply_rope(
     return q_rot, k_rot
 
 
-def conv1d(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-    """GPT-2 Conv1D projection: ``y = x @ W + b`` (weight stored as (d_in, d_out)).
-
-    This is HuggingFace's ``Conv1D`` semantics, the transpose of ``nn.Linear``.
-    See ``engine/weights.py`` for why the weight is used without transposing.
-
-    Args:
-        x:      Input.  Shape: (..., d_in)
-        weight: Stored as (d_in, d_out)  -- NOT transposed.
-        bias:   Shape: (d_out,)
-
-    Returns:
-        Projected tensor. Shape: (..., d_out)
-    """
-    return x @ weight + bias                                 # (..., d_in) @ (d_in, d_out) -> (..., d_out)

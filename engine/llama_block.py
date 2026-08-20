@@ -16,7 +16,6 @@ from engine.kv_cache import LlamaStaticKVCache
 from engine.layers import rms_norm
 from engine.llama_attention import llama_attention
 from engine.llama_mlp import swiglu_mlp
-from engine.llama_moe import moe_mlp
 
 
 def llama_block(
@@ -57,6 +56,7 @@ def llama_block(
     # pre-norm MLP sub-layer
     h = rms_norm(x, weights["post_attention_layernorm.weight"], eps)
     if config.is_moe:
+        from engine.llama_moe import moe_mlp
         x = x + moe_mlp(h, weights, config)
     else:
         x = x + swiglu_mlp(h, weights)

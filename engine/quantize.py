@@ -30,7 +30,7 @@ from dataclasses import dataclass
 import torch
 
 from engine.config import LlamaConfig
-from engine.kernels.quant import dequantize_weight_int4, quantize_weight_int4
+from engine.kernels.quant import dequantize_weight_int4, int4_matmul, quantize_weight_int4
 from engine.llama_model import LlamaModel
 from engine.llama_weights import LlamaWeights
 
@@ -58,9 +58,19 @@ class _Int4Weight:
 
     def dequantize(self, dtype: torch.dtype) -> torch.Tensor:
         """Return the reconstructed weight in (d_out, d_in) Linear layout."""
-        # packed was quantized as (d_in, d_out) column-major; transpose back.
         w_col = dequantize_weight_int4(self.packed, self.scale.to(dtype), self.group_size)
-        return w_col.T.contiguous()  # → (d_out, d_in)
+        return w_col.T.contiguous()  # (d_in, d_out) → (d_out, d_in)
+
+    def fused_linear(self, x: torch.Tensor) -> torch.Tensor:
+        """Fused W4A16 projection: x @ w_col without materializing bf16 weights.
+
+        ``int4_matmul`` unpacks INT4 nibbles on-the-fly inside a Triton kernel,
+        halving HBM reads vs the dequantize-then-matmul path.
+        """
+        leading = x.shape[:-1]
+        a = x.reshape(-1, x.shape[-1])        # (M, K=d_in)
+        out = int4_matmul(a, self.packed, self.scale, self.group_size)
+        return out.reshape(*leading, self.shape[0])  # (..., d_out)
 
 
 class QuantizedLlamaWeights:
@@ -97,42 +107,48 @@ class QuantizedLlamaWeights:
     def config(self) -> LlamaConfig:
         return self._orig.config
 
-    def layer(self, i: int) -> dict[str, torch.Tensor]:
-        """Return a weight dict for block ``i``, dequantizing INT4 projections."""
+    def layer(self, i: int) -> dict:
+        """Return a weight dict for block ``i``.
+
+        INT4 projections are returned as ``_Int4Weight`` objects; ``linear()``
+        in ``engine/layers.py`` dispatches to ``fused_linear()`` automatically.
+        Non-quantized tensors (norms, embeddings) remain plain ``torch.Tensor``.
+        """
         prefix = f"model.layers.{i}."
-        result = self._orig.layer(i)          # start with all original tensors
+        result = self._orig.layer(i)
 
         for suffix in _LINEAR_SUFFIXES:
             key = prefix + suffix
             if key in self._int4:
-                result[suffix] = self._int4[key].dequantize(self._dtype)
+                result[suffix] = self._int4[key]
 
         if self._orig.config.is_moe:
             n_exp = self._orig.config.n_experts
-            # Dequantize shared expert projections.
             for proj in _EXPERT_PROJ_SUFFIXES:
                 suffix = f"mlp.shared_expert.{proj}"
                 key = prefix + suffix
                 if key in self._int4:
-                    result[suffix] = self._int4[key].dequantize(self._dtype)
-            # Dequantize routed expert projections.
+                    result[suffix] = self._int4[key]
             for j in range(n_exp):
                 for proj in _EXPERT_PROJ_SUFFIXES:
                     suffix = f"mlp.experts.{j}.{proj}"
                     key = prefix + suffix
                     if key in self._int4:
-                        result[suffix] = self._int4[key].dequantize(self._dtype)
+                        result[suffix] = self._int4[key]
 
         return result
 
-    def expert_weights(self, layer_idx: int, expert_id: int) -> dict[str, torch.Tensor]:
-        """Return dequantized weight dict for routed expert ``expert_id`` in layer ``layer_idx``."""
+    def expert_weights(self, layer_idx: int, expert_id: int) -> dict:
+        """Return weight dict for routed expert ``expert_id`` in layer ``layer_idx``.
+
+        INT4 projections are returned as ``_Int4Weight`` objects for fused dispatch.
+        """
         prefix = f"model.layers.{layer_idx}."
         result = self._orig.expert_weights(layer_idx, expert_id)
         for proj in _EXPERT_PROJ_SUFFIXES:
             key = prefix + f"mlp.experts.{expert_id}.{proj}"
             if key in self._int4:
-                result[proj] = self._int4[key].dequantize(self._dtype)
+                result[proj] = self._int4[key]
         return result
 
 

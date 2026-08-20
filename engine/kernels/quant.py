@@ -1,17 +1,20 @@
 """Weight-only quantization kernels: INT8 (W8A16) and INT4 (W4A16).
 
-Phase 5 (original): INT8 W8A16 — 4× weight compression, per-column symmetric.
-Phase 2 scale-up:   INT4 W4A16 — 8× weight compression, per-group symmetric
-                    (group_size=128).  Per-group is mandatory for INT4 because
-                    only 16 discrete levels can't represent a whole column well.
+INT8 W8A16: 2× weight compression, per-column symmetric scale.
+INT4 W4A16: 4× weight compression, per-group symmetric scale (group_size=128).
+            Per-group is mandatory for INT4 — only 16 discrete levels can't
+            represent a whole column accurately.
 
-INT4 storage: two nibbles packed per int8 byte (high nibble = even index,
-low nibble = odd index).  Scales are stored as fp16 per (group, output_col).
+INT4 storage: two nibbles packed per int8 byte (high nibble = even row,
+low nibble = odd row).  Scales stored as float32 per (group, output_col).
+
+INT4 fused matmul: single Triton kernel reads packed INT4, unpacks nibbles,
+applies per-group scale, and accumulates directly into float32 — without
+writing the intermediate bf16 weight matrix to HBM.  This halves memory
+bandwidth vs the dequantize-then-matmul pattern.
 
 Memory at decode (batch=1):
-    bf16 7B  = 14 GB   INT8 7B  =  7 GB   INT4 7B  = 3.5 GB
-    bf16 14B = 28 GB   INT8 14B = 14 GB   INT4 14B = 7 GB
-
+    bf16 8B = 16 GB   INT4 8B = 4 GB   (4× weight reduction)
 """
 
 from __future__ import annotations
@@ -153,29 +156,129 @@ def dequantize_weight_int4(
     return w.reshape(d_in, d_out)
 
 
+@triton.jit
+def _int4_matmul_kernel(
+    A, Packed, Scale, C,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_pk, stride_pn,
+    stride_sg, stride_sn,
+    stride_cm, stride_cn,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Fused W4A16 matmul: C[M,N] = A[M,K] @ W[K,N], W stored as packed INT4.
+
+    Packed layout: packed[k//2, n] stores two int4 weights:
+        bits 7-4 (high nibble): original weight row k   (even k)
+        bits 3-0 (low  nibble): original weight row k+1 (odd  k)
+    Reads packed INT4, unpacks nibbles, scales, and accumulates into float32
+    without writing an intermediate bf16 weight tensor to HBM.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m    = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)      # (BLOCK_M,)
+    offs_n    = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)      # (BLOCK_N,)
+    offs_half = tl.arange(0, GROUP_SIZE // 2)                 # (64,) — index within packed group
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k0 in range(0, K, GROUP_SIZE):
+        # Stride-2 pointer arithmetic for even/odd A columns within this group.
+        k_even = k0 + offs_half * 2          # (64,) column indices k0, k0+2, ..., k0+126
+        k_odd  = k_even + 1                  # (64,) column indices k0+1, k0+3, ..., k0+127
+
+        a_even = tl.load(
+            A + offs_m[:, None] * stride_am + k_even[None, :] * stride_ak,
+            mask=(offs_m[:, None] < M) & (k_even[None, :] < K),
+            other=0.0,
+        )  # (BLOCK_M, GROUP_SIZE//2) bfloat16
+
+        a_odd = tl.load(
+            A + offs_m[:, None] * stride_am + k_odd[None, :] * stride_ak,
+            mask=(offs_m[:, None] < M) & (k_odd[None, :] < K),
+            other=0.0,
+        )  # (BLOCK_M, GROUP_SIZE//2) bfloat16
+
+        # Load packed weights for this group: rows [k0//2 .. k0//2 + GROUP_SIZE//2 - 1].
+        pk = k0 // 2 + offs_half             # (64,) packed-row indices
+
+        p = tl.load(
+            Packed + pk[:, None] * stride_pk + offs_n[None, :] * stride_pn,
+            mask=(pk[:, None] < K // 2) & (offs_n[None, :] < N),
+            other=0,
+        ).to(tl.int8)  # (GROUP_SIZE//2, BLOCK_N) int8
+
+        # Unpack nibbles with sign extension.
+        # High nibble (even rows): arithmetic right shift fills with sign bit.
+        high = p >> 4                                          # (64, BLOCK_N) int8 in [-8, 7]
+        # Low nibble (odd rows): isolate 4 bits, shift to top of byte, SAR back.
+        low_u = (p & 0x0F).to(tl.int8)                       # (64, BLOCK_N) int8 in [0, 15]
+        low   = (low_u << 4).to(tl.int8) >> 4                # (64, BLOCK_N) int8 in [-8, 7]
+
+        # Two tl.dot calls avoid the unfused dequantize-then-matmul memory round-trip.
+        partial = (
+            tl.dot(a_even, high.to(tl.bfloat16), allow_tf32=False)   # (BLOCK_M, BLOCK_N)
+            + tl.dot(a_odd, low.to(tl.bfloat16), allow_tf32=False)   # (BLOCK_M, BLOCK_N)
+        )  # float32 accumulator
+
+        # Per-group scale: one scalar per (group, output column), float32.
+        s = tl.load(
+            Scale + (k0 // GROUP_SIZE) * stride_sg + offs_n * stride_sn,
+            mask=offs_n < N,
+            other=0.0,
+        )  # (BLOCK_N,) float32
+
+        acc = acc + partial * s[None, :]
+
+    tl.store(
+        C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+        acc.to(tl.bfloat16),
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
 def int4_matmul(
     a: torch.Tensor,
     packed: torch.Tensor,
     scale: torch.Tensor,
     group_size: int = 128,
 ) -> torch.Tensor:
-    """Compute ``a @ W`` where W is stored as packed INT4 with per-group scales.
+    """Fused W4A16 matmul: unpacks INT4 nibbles on-the-fly, no intermediate bf16 tensor.
 
-    Dequantizes W to float on the fly (no fused kernel yet — the memory saving
-    is the primary benefit at decode batch sizes; fused INT4 matmul is a future
-    Triton kernel).
+    On CUDA, launches a Triton kernel that reads packed INT4, unpacks, scales, and
+    accumulates directly into float32 without writing a decompressed weight matrix.
+    Falls back to dequantize-then-matmul on CPU (for tests).
 
     Args:
-        a:          Activations, shape (M, d_in), float.
-        packed:     Packed int8, shape (d_in // 2, d_out).
-        scale:      Per-group scales, shape (n_groups, d_out), same dtype as ``a``.
-        group_size: Group size used at quantization time.
+        a:          Activations, shape (M, K), bfloat16.
+        packed:     Packed INT4 weights, shape (K//2, N), int8.
+        scale:      Per-group scales, shape (K//128, N), float32.
+        group_size: Must be 128 (kernel is compiled for this group size).
 
     Returns:
-        Output (M, d_out) in ``a``'s dtype.
+        Output (M, N), bfloat16.
     """
-    w = dequantize_weight_int4(packed, scale.to(a.dtype), group_size)  # (d_in, d_out)
-    return a @ w                                               # (M, d_in) @ (d_in, d_out)
+    if not a.is_cuda:
+        w = dequantize_weight_int4(packed, scale.to(a.dtype), group_size)
+        return a @ w
+    assert group_size == 128, f"fused INT4 kernel requires group_size=128, got {group_size}"
+    m, k = a.shape
+    _, n = packed.shape
+    c = torch.empty((m, n), device=a.device, dtype=a.dtype)
+    grid = (triton.cdiv(m, 16), triton.cdiv(n, 64))
+    _int4_matmul_kernel[grid](
+        a, packed, scale, c,
+        m, n, k,
+        a.stride(0), a.stride(1),
+        packed.stride(0), packed.stride(1),
+        scale.stride(0), scale.stride(1),
+        c.stride(0), c.stride(1),
+        GROUP_SIZE=128, BLOCK_M=16, BLOCK_N=64,
+    )
+    return c
 
 
 def int8_matmul(a: torch.Tensor, wq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
