@@ -194,5 +194,9 @@ session id — pass it back as `"session_id"` in a follow-up request to continue
 conversation), then `token` events as text streams in, then either a terminal `done` or
 `error` event.
 
+Sending a second request with the same `session_id` while the first one is still streaming is
+safe — it queues behind the in-flight turn and starts automatically once that turn's `done`/
+`error` event fires, rather than racing with it.
+
 `GET /healthz` returns `{"status": "loading"}` before the model finishes loading, then
 `{"status": "ok", "active_sessions": N}`.

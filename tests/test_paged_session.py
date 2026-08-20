@@ -285,6 +285,48 @@ def test_two_concurrent_sessions_do_not_interleave_output(tok):
     assert text_b == "BB"
 
 
+def test_resubmit_to_active_session_queues_instead_of_racing(tok):
+    """A second submit() for a session_id whose turn is still in flight must
+    queue behind it (not clobber session.req / corrupt _req_to_session with a
+    second concurrent LlamaRequest for the same session_id)."""
+    config = _mini_config()
+    reply_1 = "AAA<|im_end|>"
+    reply_2 = "BB<|im_end|>"
+    script = [_script_tokens(tok, reply_1), _script_tokens(tok, reply_2)]
+    model = _OrderScriptedModel(config, script)
+
+    engine = LlamaPagedEngine(model, n_total_blocks=64, block_size=8, eos_token=tok.im_end_id)
+    mgr = PagedSessionManager(engine, tok, tools=[], max_turns=4, max_new_tokens=16)
+
+    events_a: list[dict] = []
+    events_b: list[dict] = []
+    # Both submissions land in _incoming before the engine thread ever runs —
+    # simulates a client firing a second message before the first turn's
+    # 'done' event has come back.
+    mgr.submit(1, [{"role": "user", "content": "one"}], events_a.append)
+    mgr.submit(1, [{"role": "user", "content": "two"}], events_b.append)
+
+    # One scheduling tick drains both submissions: the first starts a turn,
+    # the second must be queued rather than starting a second concurrent
+    # LlamaRequest for session_id=1.
+    mgr.run_once()
+    assert 1 in mgr._sessions
+    assert mgr._sessions[1].status == "active"
+    assert mgr._pending.get(1) and len(mgr._pending[1]) == 1
+    assert events_b == [], "queued submission must not emit anything until promoted"
+
+    for _ in range(80):
+        mgr.run_once()
+        if not engine.has_work and mgr._incoming.empty() and not mgr._pending:
+            break
+
+    done_a = [e for e in events_a if e["type"] == "done"]
+    done_b = [e for e in events_b if e["type"] == "done"]
+    assert len(done_a) == 1 and done_a[0]["final_text"] == "AAA"
+    assert len(done_b) == 1 and done_b[0]["final_text"] == "BB"
+    assert mgr._pending == {}
+
+
 def test_stop_check_none_preserves_eos_behavior():
     """Regression guard: requests without stop_check still stop only on EOS/max_tokens."""
     from engine.llama_paged_engine import LlamaRequest

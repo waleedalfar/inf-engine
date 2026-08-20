@@ -16,6 +16,16 @@ history is reformatted and re-prefilled every turn, exactly like
 token cost per session but sidesteps an entire class of incremental
 position-tracking bugs, matching the deliberate correctness-over-efficiency
 choice already made in agent.py.
+
+Per-session message queuing: ``submit()`` can be called again for a
+``session_id`` that already has a turn in flight (e.g. a client fires a
+second HTTP request before the first one's ``done`` event arrives). That
+message is held in ``_pending`` rather than started immediately — starting
+it immediately would create a second concurrent ``LlamaRequest`` for the
+same session_id while the session's own bookkeeping (``session.req``,
+``_req_to_session``) can only track one at a time, corrupting whichever
+turn's completion is handled second. ``_pop_session()`` promotes the oldest
+queued message into a fresh turn as soon as the active one finishes.
 """
 
 from __future__ import annotations
@@ -99,13 +109,24 @@ class PagedSessionManager:
         self._sessions: dict[int, Session] = {}       # session_id -> Session
         self._req_to_session: dict[int, int] = {}      # LlamaRequest.req_id -> session_id
         self._next_req_id = 0
+        # session_id -> FIFO of (messages, emit) submitted while that session
+        # already had a turn in flight — promoted to a fresh turn by
+        # _pop_session() once the in-flight one finishes (see module docstring
+        # on why this can't just call _start_turn immediately: LlamaPagedEngine
+        # would end up running two concurrent requests for one session_id).
+        self._pending: dict[int, list[tuple[list[dict], Callable[[dict], None]]]] = {}
 
     # ------------------------------------------------------------------
     # Thread-safe entry point — callable from any thread
     # ------------------------------------------------------------------
 
     def submit(self, session_id: int, messages: list[dict], emit: Callable[[dict], None]) -> None:
-        """Enqueue a new user turn for *session_id*. Never blocks, never touches the engine."""
+        """Enqueue a new user turn for *session_id*. Never blocks, never touches the engine.
+
+        If *session_id* already has a turn in flight, this message is queued
+        and will start automatically once that turn completes — it does not
+        race with or clobber the active turn.
+        """
         self._incoming.put((session_id, messages, emit))
 
     # ------------------------------------------------------------------
@@ -135,15 +156,35 @@ class PagedSessionManager:
                 session_id, messages, emit = self._incoming.get_nowait()
             except queue.Empty:
                 return
-            session = self._sessions.get(session_id)
-            if session is None:
-                session = Session(session_id=session_id, messages=list(messages), emit=emit)
-                self._sessions[session_id] = session
-            else:
-                session.messages = list(messages)
-                session.emit = emit
-                session.status = "queued"
+            if session_id in self._sessions:
+                # A turn is already active for this session — queue behind it
+                # rather than starting a second concurrent LlamaRequest.
+                self._pending.setdefault(session_id, []).append((list(messages), emit))
+                continue
+            session = Session(session_id=session_id, messages=list(messages), emit=emit)
+            self._sessions[session_id] = session
             self._start_turn(session)
+
+    def _pop_session(self, session_id: int) -> None:
+        """Remove a finished/errored session, then promote its next queued
+        submission (if any) into a fresh turn. Loops instead of recursing so a
+        run of synchronous failures (e.g. repeated context_overflow) can't
+        build up stack depth."""
+        self._sessions.pop(session_id, None)
+        while True:
+            pending = self._pending.get(session_id)
+            if not pending:
+                return
+            messages, emit = pending.pop(0)
+            if not pending:
+                del self._pending[session_id]
+            session = Session(session_id=session_id, messages=messages, emit=emit)
+            self._sessions[session_id] = session
+            self._start_turn(session)
+            if session_id in self._sessions:
+                return  # started successfully — stop promoting
+            # _start_turn failed synchronously and already popped session_id
+            # back out — loop to try the next queued submission, if any.
 
     def _start_turn(self, session: Session) -> None:
         prompt = format_messages(session.messages, self.tool_list or None, self.enable_thinking)
@@ -218,7 +259,7 @@ class PagedSessionManager:
             session.messages = session.messages + [{"role": "assistant", "content": raw_text}]
             session.status = "done"
             session.emit({"type": "done", "final_text": visible_text, "turns": session.turn + 1})
-            self._sessions.pop(session.session_id, None)
+            self._pop_session(session.session_id)
             return
 
         session.messages, calls = dispatch_tool_calls(
@@ -235,7 +276,7 @@ class PagedSessionManager:
             session.emit(
                 {"type": "done", "final_text": strip_thinking(last), "turns": session.turn}
             )
-            self._sessions.pop(session.session_id, None)
+            self._pop_session(session.session_id)
             return
 
         self._start_turn(session)
