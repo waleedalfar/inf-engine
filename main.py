@@ -36,6 +36,7 @@ from engine.config import (
 from engine.kv_cache import LlamaStaticKVCache
 from engine.llama_model import LlamaModel
 from engine.llama_moe_model import load_moe_weights, load_moe_weights_disk
+from engine.llama_paged_engine import LlamaPagedEngine, LlamaRequest
 from engine.llama_weights import load_llama_weights
 from engine.quantize import quantize_llama, quantized_to_device
 from engine.qwen_tokenizer import QwenTokenizer
@@ -386,6 +387,48 @@ class VerboseAgentLoop(AgentLoop):
             return None
 
 
+class GraphedVerboseAgentLoop(VerboseAgentLoop):
+    """VerboseAgentLoop that routes decode through LlamaPagedEngine (CUDA graphs).
+
+    The paged engine owns its own KV pool, so the cache_factory arg is ignored
+    (overridden to return None).  Each turn submits the full prompt to the engine
+    and lets it run prefill + graphed decode to completion.
+    """
+
+    def __init__(self, *args, engine: LlamaPagedEngine, **kwargs):
+        kwargs["cache_factory"] = lambda: None
+        super().__init__(*args, **kwargs)
+        self.engine = engine
+        self._req_id = 0
+
+    def _generate_to_eos(self, ids: list[int], cache) -> list[int]:  # cache is None, ignored
+        import time
+
+        req = LlamaRequest(
+            req_id=self._req_id,
+            prompt_ids=ids,
+            max_new_tokens=self.max_new_tokens,
+        )
+        self._req_id += 1
+        self.engine.completed.clear()
+
+        print("Agent: ", end="", flush=True)
+        t0 = time.perf_counter()
+
+        results = self.engine.run_offline([req])
+        gen_ids = results[req.req_id]
+
+        elapsed = time.perf_counter() - t0
+        n_gen = len(gen_ids)
+        tps = n_gen / elapsed if elapsed > 0 else 0
+
+        trim = gen_ids[:-1] if gen_ids and gen_ids[-1] == self.eos_token_id else gen_ids
+        text = self.tokenizer.decode(trim, skip_special_tokens=False)
+        print(text, flush=True)
+        print(f"\n  [{n_gen} tokens, {tps:.2f} tok/s]", flush=True)
+        return gen_ids
+
+
 class SpeculativeVerboseAgentLoop(VerboseAgentLoop):
     """VerboseAgentLoop that uses a small draft model to speed up generation.
 
@@ -449,6 +492,7 @@ def load_model(
     quantize: bool = False,
     expert_offload: str = "disk",
     cache_mb: float = 2_000,
+    quantize_lm_head: bool = False,
 ):
     print(f"Loading weights from {model_dir} ...")
     if config.is_moe:
@@ -467,7 +511,7 @@ def load_model(
             weights = load_llama_weights(model_dir, config, device="cpu", dtype=dtype)
             model = LlamaModel(weights, config)
             print("Quantizing to INT4 W4A16 on CPU ...")
-            model = quantize_llama(model)
+            model = quantize_llama(model, quantize_lm_head=quantize_lm_head)
             print(f"Moving INT4 weights to {device} ...")
             model = quantized_to_device(model, device)
         else:
@@ -475,7 +519,7 @@ def load_model(
             model = LlamaModel(weights, config)
             if quantize:
                 print("Quantizing to INT4 W4A16 ...")
-                model = quantize_llama(model)
+                model = quantize_llama(model, quantize_lm_head=quantize_lm_head)
         if quantize:
             vram = torch.cuda.memory_allocated() / 1e9 if device == "cuda" else 0
             print(f"Quantization done — {vram:.1f} GB VRAM in use")
@@ -546,6 +590,14 @@ def main():
         help="Disable INT4 quantization even for large models.",
     )
     parser.add_argument(
+        "--quantize-lm-head", action="store_true",
+        help="Also quantize the final lm_head projection to INT4 (default: off). "
+             "For Qwen3-8B this saves ~1.24GB/token of decode bandwidth (~25%% on top of "
+             "the quantized transformer body) but adds a small quality cost — measured "
+             "96.7%% argmax agreement with the bf16 head on a real prompt. Ignored when "
+             "the model ties word embeddings (lm_head == embed_tokens) or isn't quantized.",
+    )
+    parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu",
     )
     parser.add_argument(
@@ -573,6 +625,16 @@ def main():
         "--compile", action="store_true",
         help="Wrap model.forward with torch.compile(mode='reduce-overhead'). "
              "First response takes ~60s to compile; subsequent calls are 10-30%% faster.",
+    )
+    cg_group = parser.add_mutually_exclusive_group()
+    cg_group.add_argument(
+        "--cuda-graphs", dest="cuda_graphs", action="store_true", default=None,
+        help="Use CUDA graph decode via LlamaPagedEngine (auto-on when device=cuda "
+             "and no draft model). Eliminates per-token kernel-launch overhead.",
+    )
+    cg_group.add_argument(
+        "--no-cuda-graphs", dest="cuda_graphs", action="store_false",
+        help="Disable CUDA graph decode, use eager per-token forward instead.",
     )
     parser.add_argument(
         "--repetition-penalty", type=float, default=1.1,
@@ -618,6 +680,7 @@ def main():
         quantize=args.quantize,
         expert_offload=args.expert_offload,
         cache_mb=args.cache_mb,
+        quantize_lm_head=args.quantize_lm_head,
     )
     if args.compile:
         print("Compiling model (one-time, ~60s) ...")
@@ -676,7 +739,28 @@ def main():
         )
         print(f"Speculative decoding enabled: {draft_config.name} draft, {args.n_draft} tokens/step")
     else:
-        agent = VerboseAgentLoop(**agent_kwargs)
+        # Auto-enable CUDA graph decode on CUDA unless --compile is set (compile already
+        # captures graphs under the hood; combining both would double-capture).
+        cuda_graphs = args.cuda_graphs
+        if cuda_graphs is None:
+            cuda_graphs = (args.device == "cuda" and not args.compile)
+
+        if cuda_graphs:
+            block_size = 16
+            # +64 headroom so the last-block partial fill never exhausts the pool.
+            n_blocks = (args.max_ctx + block_size - 1) // block_size + 64
+            paged_engine = LlamaPagedEngine(
+                model,
+                n_total_blocks=n_blocks,
+                block_size=block_size,
+                eos_token=tokenizer.im_end_id,
+                sampling=agent_kwargs["sampling"],
+                enable_cuda_graphs=True,
+            )
+            agent = GraphedVerboseAgentLoop(**agent_kwargs, engine=paged_engine)
+            print("CUDA graph decode enabled (LlamaPagedEngine).")
+        else:
+            agent = VerboseAgentLoop(**agent_kwargs)
 
     print(f"\nWorkspace: {workspace}")
     print("Type /exit to quit, /clear to reset, /tools to list tools, /history to review.\n")
