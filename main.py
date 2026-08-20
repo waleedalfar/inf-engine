@@ -1,15 +1,19 @@
 """Qwen3 interactive coding assistant using the custom inference engine.
 
 Usage:
-    python main.py --model-dir weights/Qwen--Qwen3-0.6B
-    python main.py --model-dir weights/Qwen--Qwen3-0.6B --workspace ~/myproject
-    python main.py --model-dir weights/Qwen--Qwen3-1.7B --system "You are a senior Python engineer."
+    python main.py --model-dir weights/Qwen--Qwen3-8B
+    python main.py --model-dir weights/Qwen--Qwen3-8B --workspace ~/myproject
+    python main.py --model-dir weights/Qwen--Qwen3-8B --system "You are a senior Python engineer."
+    python main.py --show-history          # print all past sessions and exit
+    python main.py --show-history 5        # print last 5 sessions and exit
 
 In-chat commands:
     /clear    Reset conversation (keeps system prompt)
     /tools    List available tools
-    /history  Print conversation so far
+    /history  Print current session so far
     /exit     Quit (also Ctrl+C or Ctrl+D)
+
+Sessions are appended to ~/.qwen3_history.jsonl on exit.
 
 The model directory must contain either:
   - tokenizer.json (HuggingFace format)  OR  qwen.tiktoken
@@ -17,7 +21,10 @@ The model directory must contain either:
 """
 
 import argparse
+import datetime
+import json
 import os
+import re
 import subprocess
 from pathlib import Path
 import torch
@@ -34,6 +41,71 @@ from engine.quantize import quantize_llama, quantized_to_device
 from engine.qwen_tokenizer import QwenTokenizer
 from engine.agent import AgentLoop, Tool
 from engine.sampling import SamplingConfig, sample_next_token
+
+# ---------------------------------------------------------------------------
+# Session history helpers
+# ---------------------------------------------------------------------------
+
+_DEFAULT_HISTORY = Path("~/.qwen3_history.jsonl")
+
+
+def _save_session(
+    history_file: Path,
+    model_name: str,
+    workspace: Path,
+    messages: list[dict],
+) -> None:
+    """Append the completed session to the history JSONL file."""
+    convo = [m for m in messages if m["role"] in ("user", "assistant")]
+    if not convo:
+        return
+    record = {
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        "model": model_name,
+        "workspace": str(workspace),
+        "messages": convo,
+    }
+    try:
+        history_file.parent.mkdir(parents=True, exist_ok=True)
+        with history_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError:
+        pass
+
+
+def _show_history(history_file: Path, last_n: int | None = None) -> None:
+    """Print past sessions from the history file."""
+    if not history_file.exists():
+        print("No history yet.")
+        return
+    sessions = []
+    with history_file.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    sessions.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    if not sessions:
+        print("No history yet.")
+        return
+    if last_n is not None:
+        sessions = sessions[-last_n:]
+    for s in sessions:
+        print(f"\n=== {s.get('ts', '?')}  |  {s.get('model', '?')}  |  {s.get('workspace', '?')} ===")
+        for m in s.get("messages", []):
+            role = m["role"]
+            content = m.get("content", "")
+            if role == "assistant":
+                content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+            preview = content[:300].replace("\n", " ")
+            if len(content) > 300:
+                preview += "..."
+            label = "You:   " if role == "user" else "Agent: "
+            print(f"  {label}{preview}")
+    print()
+
 
 # Maps directory-name fragments → config, largest first so "Qwen3-14B"
 # doesn't accidentally match before "Qwen3-1.7B".
@@ -368,8 +440,9 @@ def make_cache_factory(config: LlamaConfig, device: str, dtype: torch.dtype, max
 def main():
     parser = argparse.ArgumentParser(description="Qwen3 interactive coding assistant")
     parser.add_argument(
-        "--model-dir", required=True,
-        help="Path to the model directory (safetensors + tokenizer files)",
+        "--model-dir", default=None,
+        help="Path to the model directory (safetensors + tokenizer files). "
+             "Required except when using --show-history.",
     )
     parser.add_argument(
         "--workspace", default=".",
@@ -416,8 +489,27 @@ def main():
              "'ram' loads all experts into pinned CPU RAM (needs ~57 GB for 30B-A3B). "
              "Default: disk.",
     )
+    parser.add_argument(
+        "--history-file", default=str(_DEFAULT_HISTORY),
+        help=f"Path to the JSONL session log (default: {_DEFAULT_HISTORY}). "
+             "Each session is appended as one JSON line on exit.",
+    )
+    parser.add_argument(
+        "--show-history", metavar="N", nargs="?", const=0, type=int,
+        help="Print past sessions and exit. Optionally pass N to show only the last N sessions.",
+    )
     parser.set_defaults(quantize=None)  # None = auto-detect based on model size
     args = parser.parse_args()
+
+    history_file = Path(args.history_file).expanduser().resolve()
+
+    if args.show_history is not None:
+        last_n = args.show_history if args.show_history > 0 else None
+        _show_history(history_file, last_n=last_n)
+        return
+
+    if args.model_dir is None:
+        parser.error("--model-dir is required (except with --show-history)")
 
     try:
         import readline  # noqa: F401 — enables arrow-key navigation and input history
@@ -479,47 +571,51 @@ def main():
 
     messages = [{"role": "system", "content": system_prompt}]
 
-    while True:
-        try:
-            user_input = input("You: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nBye.")
-            break
+    try:
+        while True:
+            try:
+                user_input = input("You: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nBye.")
+                break
 
-        if not user_input:
-            continue
+            if not user_input:
+                continue
 
-        if user_input == "/exit":
-            print("Bye.")
-            break
+            if user_input == "/exit":
+                print("Bye.")
+                break
 
-        if user_input == "/clear":
-            messages = [messages[0]]  # keep system prompt
-            print("Conversation cleared.\n")
-            continue
+            if user_input == "/clear":
+                messages = [messages[0]]  # keep system prompt
+                print("Conversation cleared.\n")
+                continue
 
-        if user_input == "/tools":
-            for t in tools:
-                print(f"  {t.name}: {t.description}")
+            if user_input == "/tools":
+                for t in tools:
+                    print(f"  {t.name}: {t.description}")
+                print()
+                continue
+
+            if user_input == "/history":
+                convo = [m for m in messages if m["role"] in ("user", "assistant")]
+                if not convo:
+                    print("  (no conversation yet)\n")
+                else:
+                    for m in convo:
+                        preview = m.get("content", "")[:200].replace("\n", " ")
+                        print(f"  [{m['role']}] {preview}")
+                    print()
+                continue
+
+            messages.append({"role": "user", "content": user_input})
+            print()  # blank line before streamed output
+            result = agent.run(messages)
+            messages = result.messages  # accumulate full history for next turn
             print()
-            continue
-
-        if user_input == "/history":
-            if len(messages) <= 1:
-                print("  (no conversation yet)\n")
-            for m in messages:
-                if m["role"] == "system":
-                    continue
-                preview = m.get("content", "")[:200].replace("\n", " ")
-                print(f"  [{m['role']}] {preview}")
-            print()
-            continue
-
-        messages.append({"role": "user", "content": user_input})
-        print()  # blank line before streamed output
-        result = agent.run(messages)
-        messages = result.messages  # accumulate full history for next turn
-        print()
+    finally:
+        _save_session(history_file, config.name, workspace, messages)
+        print(f"(session saved to {history_file})")
 
 
 if __name__ == "__main__":
