@@ -43,6 +43,7 @@ from engine.qwen_tokenizer import QwenTokenizer
 from engine.agent import AgentLoop, Tool
 from engine.sampling import SamplingConfig, SamplingMode, sample_next_token
 from engine.speculative import SpeculativeDecoder
+from engine.speculative_paged_engine import SpeculativePagedEngine
 
 # ---------------------------------------------------------------------------
 # Session history helpers
@@ -429,6 +430,47 @@ class GraphedVerboseAgentLoop(VerboseAgentLoop):
         return gen_ids
 
 
+class SpeculativeGraphedAgentLoop(VerboseAgentLoop):
+    """VerboseAgentLoop that uses SpeculativePagedEngine (draft CUDA graphs + eager verify)."""
+
+    def __init__(self, *args, engine: SpeculativePagedEngine, **kwargs):
+        kwargs["cache_factory"] = lambda: None
+        super().__init__(*args, **kwargs)
+        self.engine = engine
+        self._req_id = 0
+
+    def _generate_to_eos(self, ids: list[int], cache) -> list[int]:  # cache is None, ignored
+        import time
+
+        req = LlamaRequest(
+            req_id=self._req_id,
+            prompt_ids=ids,
+            max_new_tokens=self.max_new_tokens,
+        )
+        self._req_id += 1
+
+        print("Agent: ", end="", flush=True)
+        t0 = time.perf_counter()
+
+        results, stats = self.engine.run_offline([req])
+        gen_ids = results[req.req_id]
+
+        elapsed = time.perf_counter() - t0
+        n_gen = len(gen_ids)
+        tps = n_gen / elapsed if elapsed > 0 else 0
+
+        trim = gen_ids[:-1] if gen_ids and gen_ids[-1] == self.eos_token_id else gen_ids
+        text = self.tokenizer.decode(trim, skip_special_tokens=False)
+        print(text, flush=True)
+        print(
+            f"\n  [{n_gen} tokens, {tps:.2f} tok/s | "
+            f"accept {stats.acceptance_rate:.0%}, "
+            f"{stats.tokens_per_step:.1f} tok/step]",
+            flush=True,
+        )
+        return gen_ids
+
+
 class SpeculativeVerboseAgentLoop(VerboseAgentLoop):
     """VerboseAgentLoop that uses a small draft model to speed up generation.
 
@@ -674,6 +716,18 @@ def main():
             print(f"Auto-enabling INT4 quantization for {config.name} "
                   f"(d_model={config.d_model}). Pass --no-quantize to disable.")
 
+    # Phase 2: auto-enable lm_head quantization when spec+CUDA-graph path will be used.
+    # Detect early (before model load) so the flag is passed to load_model.
+    _will_spec_graph = (
+        args.draft_model_dir is not None
+        and bool(args.cuda_graphs or (args.cuda_graphs is None and args.device == "cuda" and not args.compile))
+        and bool(args.quantize)
+    )
+    if _will_spec_graph and not args.quantize_lm_head:
+        args.quantize_lm_head = True
+        print("Auto-enabling --quantize-lm-head for spec+CUDA-graph path "
+              "(saves ~1.24 GB/tok decode bandwidth on the target model).")
+
     tokenizer = QwenTokenizer(args.model_dir)
     model = load_model(
         args.model_dir, config, args.device, dtype,
@@ -729,7 +783,42 @@ def main():
         max_ctx=args.max_ctx,
     )
 
-    if draft_model is not None:
+    # Auto-detect CUDA graph preference (shared by both draft and no-draft paths).
+    cuda_graphs = args.cuda_graphs
+    if cuda_graphs is None:
+        cuda_graphs = (args.device == "cuda" and not args.compile)
+
+    if draft_model is not None and cuda_graphs:
+        # Best path: spec decode with CUDA-graphed draft + eager verify target.
+        block_size = 16
+        n_blocks = (args.max_ctx + block_size - 1) // block_size + 64
+        target_engine = LlamaPagedEngine(
+            model,
+            n_total_blocks=n_blocks,
+            block_size=block_size,
+            eos_token=tokenizer.im_end_id,
+            sampling=agent_kwargs["sampling"],
+            enable_cuda_graphs=False,   # target uses eager verify (q_len=K+1)
+        )
+        draft_engine = LlamaPagedEngine(
+            draft_model,
+            n_total_blocks=n_blocks,
+            block_size=block_size,
+            eos_token=tokenizer.im_end_id,
+            sampling=agent_kwargs["sampling"],
+            enable_cuda_graphs=True,    # draft uses CUDA graphs for q_len=1 steps
+        )
+        spec_paged = SpeculativePagedEngine(
+            target_engine, draft_engine,
+            n_draft=args.n_draft,
+            eos_token=tokenizer.im_end_id,
+        )
+        agent = SpeculativeGraphedAgentLoop(**agent_kwargs, engine=spec_paged)
+        print(
+            f"Spec+CUDA-graph decode enabled: {draft_config.name} draft, "
+            f"{args.n_draft} tokens/step."
+        )
+    elif draft_model is not None:
         spec_decoder = SpeculativeDecoder(draft=draft_model, target=model, n_draft=args.n_draft)
         draft_cache_factory = make_cache_factory(draft_config, args.device, dtype, max_seq=args.max_ctx)
         agent = SpeculativeVerboseAgentLoop(
@@ -738,29 +827,22 @@ def main():
             draft_cache_factory=draft_cache_factory,
         )
         print(f"Speculative decoding enabled: {draft_config.name} draft, {args.n_draft} tokens/step")
+    elif cuda_graphs:
+        block_size = 16
+        # +64 headroom so the last-block partial fill never exhausts the pool.
+        n_blocks = (args.max_ctx + block_size - 1) // block_size + 64
+        paged_engine = LlamaPagedEngine(
+            model,
+            n_total_blocks=n_blocks,
+            block_size=block_size,
+            eos_token=tokenizer.im_end_id,
+            sampling=agent_kwargs["sampling"],
+            enable_cuda_graphs=True,
+        )
+        agent = GraphedVerboseAgentLoop(**agent_kwargs, engine=paged_engine)
+        print("CUDA graph decode enabled (LlamaPagedEngine).")
     else:
-        # Auto-enable CUDA graph decode on CUDA unless --compile is set (compile already
-        # captures graphs under the hood; combining both would double-capture).
-        cuda_graphs = args.cuda_graphs
-        if cuda_graphs is None:
-            cuda_graphs = (args.device == "cuda" and not args.compile)
-
-        if cuda_graphs:
-            block_size = 16
-            # +64 headroom so the last-block partial fill never exhausts the pool.
-            n_blocks = (args.max_ctx + block_size - 1) // block_size + 64
-            paged_engine = LlamaPagedEngine(
-                model,
-                n_total_blocks=n_blocks,
-                block_size=block_size,
-                eos_token=tokenizer.im_end_id,
-                sampling=agent_kwargs["sampling"],
-                enable_cuda_graphs=True,
-            )
-            agent = GraphedVerboseAgentLoop(**agent_kwargs, engine=paged_engine)
-            print("CUDA graph decode enabled (LlamaPagedEngine).")
-        else:
-            agent = VerboseAgentLoop(**agent_kwargs)
+        agent = VerboseAgentLoop(**agent_kwargs)
 
     print(f"\nWorkspace: {workspace}")
     print("Type /exit to quit, /clear to reset, /tools to list tools, /history to review.\n")

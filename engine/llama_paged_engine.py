@@ -450,6 +450,96 @@ class LlamaPagedEngine:
 
         return completions
 
+    # ------------------------------------------------------------------
+    # Speculative decode helpers (called by SpeculativePagedEngine)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _step_one_graphed(
+        self, seq_id: int, context_ids: torch.Tensor | None = None,
+    ) -> tuple[int, torch.Tensor]:
+        """Single-sequence q_len=1 decode; returns (token_id, raw_logits_row).
+
+        Uses a captured CUDA graph when ``enable_cuda_graphs`` is True,
+        otherwise falls back to eager. ``context_ids`` (1-D tensor of all
+        generated token ids so far) is forwarded to repetition penalty sampling.
+        Caller must call ``cache.ensure_slot(seq_id)`` before each invocation.
+        """
+        if not self.enable_cuda_graphs:
+            return self._step_one_eager(seq_id, context_ids)
+
+        seq_len = self.cache.seq_lens[seq_id]
+        bucket = self._pick_bucket(1, seq_len + 1)
+        if bucket is None:
+            return self._step_one_eager(seq_id, context_ids)
+        batch_bucket, len_bucket = bucket
+
+        cg = self._graphs.get(bucket)
+        if cg is None:
+            cg = self._capture_graph(batch_bucket, len_bucket, [seq_id])
+            self._graphs[bucket] = cg
+
+        self._fill_graph_inputs(cg, [seq_id])
+        cg.graph.replay()
+
+        logits_row = cg.logits[0, -1, :]                                # (vocab,)
+        ctx_2d = context_ids.unsqueeze(0) if context_ids is not None else None
+        tok = int(sample_next_token(logits_row.unsqueeze(0), self.cfg, ctx_2d).item())
+
+        self.cache.seq_lens[seq_id] += 1                                 # extend_static doesn't update this
+        req = self._active[seq_id][0]
+        self._active[seq_id] = (req, torch.tensor([tok], device=self.device))
+        return tok, logits_row
+
+    @torch.no_grad()
+    def _step_one_eager(
+        self, seq_id: int, context_ids: torch.Tensor | None = None,
+    ) -> tuple[int, torch.Tensor]:
+        """Eager single-sequence q_len=1 decode. CPU fallback / test path."""
+        L = self.cache.seq_lens[seq_id]
+        seq_lens_t = torch.tensor([L], device=self.device)
+        ar = torch.arange(L + 1, device=self.device)
+        attn_mask = (ar[None, :] <= seq_lens_t[:, None])[:, None, :]    # (1, 1, L+1)
+        ids = self._active[seq_id][1].view(1, 1)
+        pos = seq_lens_t.view(1, 1)
+        self.cache.begin_step([seq_id])
+        logits = self.model.forward(
+            ids, cache=self.cache, start_pos=0,
+            position_ids=pos, attn_mask=attn_mask,
+        )
+        # cache.extend() inside forward already advanced seq_lens[seq_id]
+        logits_row = logits[0, -1, :]
+        ctx_2d = context_ids.unsqueeze(0) if context_ids is not None else None
+        tok = int(sample_next_token(logits_row.unsqueeze(0), self.cfg, ctx_2d).item())
+        req = self._active[seq_id][0]
+        self._active[seq_id] = (req, torch.tensor([tok], device=self.device))
+        return tok, logits_row
+
+    @torch.no_grad()
+    def _step_verify_eager(self, seq_id: int, verify_ids: list[int]) -> torch.Tensor:
+        """Eager multi-token forward for the target verify step.
+
+        Writes K+1 KV entries into the cache and returns raw ``(K+1, vocab)``
+        logits. Does NOT sample — the caller (SpeculativePagedEngine) runs
+        accept/reject on the returned logits.
+        """
+        K1 = len(verify_ids)
+        L = self.cache.seq_lens[seq_id]
+        self.cache.ensure_slots_for(seq_id, K1)
+        self.cache.begin_step([seq_id])
+        ids = torch.tensor([verify_ids], device=self.device)            # (1, K+1)
+        pos_ids = torch.arange(L, L + K1, device=self.device).unsqueeze(0)  # (1, K+1)
+        T_total = L + K1
+        ar = torch.arange(T_total, device=self.device)
+        q_abs = pos_ids[0]                                              # (K+1,)
+        attn_mask = (ar[None, :] <= q_abs[:, None])[None, :, :]        # (1, K+1, T_total) causal
+        logits = self.model.forward(
+            ids, cache=self.cache, start_pos=0,
+            position_ids=pos_ids, attn_mask=attn_mask,
+        )                                                                # (1, K+1, vocab)
+        # extend() advanced seq_lens[seq_id] by K1
+        return logits[0]                                                 # (K+1, vocab)
+
     @torch.no_grad()
     def step(self, now: float = 0.0) -> list[LlamaRequest]:
         """One iteration: admit queued requests → decode → evict finished.

@@ -153,6 +153,20 @@ class PagedLlamaKVCache:
         if length > 0 and length % self.manager.block_size == 0:
             self.block_table[seq_id].extend(self.manager.allocate(1))
 
+    def ensure_slots_for(self, seq_id: int, n_tokens: int) -> None:
+        """Guarantee room for at least ``n_tokens`` more tokens in the sequence.
+
+        Unlike ``ensure_slot`` (which only allocates at exact block boundaries),
+        this allocates however many blocks are needed so that
+        ``seq_lens[seq_id] + n_tokens`` tokens can be stored. Used by the
+        speculative verify step to pre-allocate K+1 slots in one call.
+        """
+        length = self.seq_lens[seq_id]
+        needed = self.manager.blocks_needed(length + n_tokens)
+        current = len(self.block_table[seq_id])
+        if needed > current:
+            self.block_table[seq_id].extend(self.manager.allocate(needed - current))
+
     def free_sequence(self, seq_id: int) -> None:
         """Return all physical blocks of ``seq_id`` to the pool."""
         self.manager.free(self.block_table.pop(seq_id, []))
