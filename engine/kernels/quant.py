@@ -240,6 +240,91 @@ def _int4_matmul_kernel(
     )
 
 
+@triton.jit
+def _int4_gemv_kernel(
+    A, Packed, Scale, C,
+    N, K,
+    stride_ak,
+    stride_pk, stride_pn,
+    stride_sg, stride_sn,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """M=1 fused W4A16 GEMV: C[1,N] = A[1,K] @ W[K,N], W stored as packed INT4.
+
+    Specialised for the decode batch-size-1 case: the (BLOCK_N,) accumulator
+    uses ~16× fewer registers than the (BLOCK_M=16, BLOCK_N) tile kernel,
+    allowing many more programs to reside concurrently per SM and better hide
+    HBM latency (the dominant cost at decode time, where we are
+    memory-bandwidth-bound, not compute-bound).
+
+    Grid: (cdiv(N, BLOCK_N),) — one 1-D program axis for output columns only.
+    The caller guarantees M == 1; the M dimension is not iterated.
+
+    NOTE: This kernel is correct (verified by tests) but is NOT currently
+    dispatched in production because tl.sum-based inner products cannot use
+    tensor cores, making it slower than the tile kernel's tl.dot path even for
+    M=1. A future split-K approach (more M=16 tile blocks, each covering K/S)
+    would preserve tensor-core throughput while improving SM occupancy.
+    """
+    pid_n  = tl.program_id(0)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < N
+
+    acc    = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    offs_k = tl.arange(0, GROUP_SIZE // 2)
+
+    for k0 in range(0, K, GROUP_SIZE):
+        k_even = k0 + offs_k * 2
+        k_odd  = k_even + 1
+
+        # A[0, k_even] and A[0, k_odd] — single row, loaded as float32.
+        a_even = tl.load(A + k_even * stride_ak, mask=k_even < K, other=0.0).to(tl.float32)
+        a_odd  = tl.load(A + k_odd  * stride_ak, mask=k_odd  < K, other=0.0).to(tl.float32)
+
+        pk = k0 // 2 + offs_k
+        p  = tl.load(
+            Packed + pk[:, None] * stride_pk + offs_n[None, :] * stride_pn,
+            mask=(pk[:, None] < K // 2) & n_mask[None, :],
+            other=0,
+        ).to(tl.int8)   # (GS//2, BLOCK_N)
+
+        high = p >> 4
+        low  = ((p & 0x0F).to(tl.int8) << 4).to(tl.int8) >> 4
+
+        partial = (
+            tl.sum(a_even[:, None] * high.to(tl.float32), axis=0)
+            + tl.sum(a_odd[:, None]  * low.to(tl.float32),  axis=0)
+        )
+
+        s = tl.load(
+            Scale + (k0 // GROUP_SIZE) * stride_sg + offs_n * stride_sn,
+            mask=n_mask, other=0.0,
+        )
+        acc += partial * s
+
+    tl.store(C + offs_n, acc.to(tl.bfloat16), mask=n_mask)
+
+
+def _decode_launch_config(n: int, k: int) -> tuple[int, int]:
+    """(BLOCK_N, num_warps) for decode-shaped (M<=16) INT4 matmuls.
+
+    Smaller BLOCK_N launches more blocks → higher SM occupancy → better HBM
+    latency hiding (the dominant cost at M=1 decode). BLOCK_N=16 is the tensor-
+    core minimum on bf16 (16×16×16 WMMA tile); going below loses tensor cores.
+    num_warps=4 keeps the register file small enough that each SM can host
+    multiple concurrent blocks.
+    """
+    if n <= 2048:
+        block_n = 16
+    elif n <= 8192:
+        block_n = 32
+    else:
+        block_n = 64
+    num_warps = 4
+    return block_n, num_warps
+
+
 def int4_matmul(
     a: torch.Tensor,
     packed: torch.Tensor,
@@ -268,7 +353,8 @@ def int4_matmul(
     m, k = a.shape
     _, n = packed.shape
     c = torch.empty((m, n), device=a.device, dtype=a.dtype)
-    grid = (triton.cdiv(m, 16), triton.cdiv(n, 64))
+    block_n, num_warps = _decode_launch_config(n, k)
+    grid = (triton.cdiv(m, 16), triton.cdiv(n, block_n))
     _int4_matmul_kernel[grid](
         a, packed, scale, c,
         m, n, k,
@@ -276,7 +362,7 @@ def int4_matmul(
         packed.stride(0), packed.stride(1),
         scale.stride(0), scale.stride(1),
         c.stride(0), c.stride(1),
-        GROUP_SIZE=128, BLOCK_M=16, BLOCK_N=64,
+        GROUP_SIZE=128, BLOCK_M=16, BLOCK_N=block_n, num_warps=num_warps,
     )
     return c
 

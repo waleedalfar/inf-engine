@@ -99,7 +99,7 @@ def test_compression_ratio():
 # Model-level test (synthetic mini-LLaMA, no weights file needed)
 # ---------------------------------------------------------------------------
 
-def _make_mini_llama():
+def _make_mini_llama(tie_word_embeddings: bool = True):
     """Build a tiny LlamaModel with random weights for quantization testing."""
     from engine.config import LlamaConfig
     from engine.llama_model import LlamaModel
@@ -116,7 +116,7 @@ def _make_mini_llama():
         intermediate_size=128,
         rope_theta=10000.0,
         norm_eps=1e-5,
-        tie_word_embeddings=True,
+        tie_word_embeddings=tie_word_embeddings,
     )
 
     torch.manual_seed(42)
@@ -129,6 +129,8 @@ def _make_mini_llama():
         "model.embed_tokens.weight": rand(cfg.vocab_size, d),
         "model.norm.weight": torch.ones(d),
     }
+    if not tie_word_embeddings:
+        tensors["lm_head.weight"] = rand(cfg.vocab_size, d)
     for i in range(cfg.n_layer):
         p = f"model.layers.{i}."
         tensors.update({
@@ -179,3 +181,134 @@ def test_quantize_llama_memory_reduction():
     # The print from quantize_llama includes the ratio — just check it runs.
     q_model = quantize_llama(model, group_size=64)
     assert q_model is not None
+
+
+def test_quantize_lm_head_skipped_when_tied():
+    """quantize_lm_head=True must be a no-op when embeddings are tied — lm_head
+    is just a view of embed_tokens there, quantizing it would corrupt the
+    (unquantized) embedding lookup too."""
+    from engine.quantize import quantize_llama
+
+    model, cfg = _make_mini_llama(tie_word_embeddings=True)
+    assert cfg.tie_word_embeddings
+    q_model = quantize_llama(model, group_size=64, quantize_lm_head=True)
+
+    assert not hasattr(q_model.w.lm_head, "fused_linear")
+    assert q_model.w.lm_head is q_model.w.embed_tokens
+
+
+def test_quantize_lm_head_output_close():
+    """Quantizing lm_head (untied case) should still produce close-ish logits,
+    and forward() must actually route through the fused INT4 kernel (not
+    silently fall back to the bf16 tensor)."""
+    from engine.quantize import quantize_llama
+
+    model, cfg = _make_mini_llama(tie_word_embeddings=False)
+    assert not cfg.tie_word_embeddings
+
+    torch.manual_seed(0)
+    ids = torch.randint(0, cfg.vocab_size, (1, 8))
+    with torch.no_grad():
+        ref = model.forward(ids)
+
+    q_model = quantize_llama(model, group_size=64, quantize_lm_head=True)
+
+    # Assert the new path's own state directly, not just output parity —
+    # lm_head must actually be the fused INT4 weight object now.
+    assert hasattr(q_model.w.lm_head, "fused_linear")
+    assert q_model.w.lm_head.shape == (cfg.vocab_size, cfg.d_model)
+
+    with torch.no_grad():
+        out = q_model.forward(ids)
+
+    rel_err = ((ref - out).norm() / ref.norm()).item()
+    print(f"  mini-LLaMA INT4 (incl. lm_head) relative logit error: {rel_err:.4f}")
+    assert rel_err < 2.0, f"Quantized model logit error {rel_err:.4f} unexpectedly large"
+
+
+def test_quantize_lm_head_off_by_default():
+    """Default behavior (quantize_lm_head unset) must be unchanged: lm_head
+    stays a plain bf16/float tensor, no fused_linear."""
+    from engine.quantize import quantize_llama
+
+    model, cfg = _make_mini_llama(tie_word_embeddings=False)
+    q_model = quantize_llama(model, group_size=64)
+
+    assert not hasattr(q_model.w.lm_head, "fused_linear")
+    assert isinstance(q_model.w.lm_head, torch.Tensor)
+
+
+# ---------------------------------------------------------------------------
+# GEMV kernel tests (M=1 decode path)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("d_in,d_out", [
+    (256,  128),
+    (512,  256),
+    (512,  512),
+    (1024, 512),
+    (4096, 1024),   # Qwen3-8B k/v-proj shape
+    (4096, 4096),   # Qwen3-8B q/o-proj shape
+])
+def test_gemv_matches_reference(d_in, d_out):
+    """int4_matmul with M=1 (GEMV path) must match dequant+matmul reference."""
+    if DEVICE != "cuda":
+        pytest.skip("GEMV kernel is CUDA-only")
+    torch.manual_seed(7)
+    w = torch.randn(d_in, d_out)
+    a = torch.randn(1, d_in, dtype=torch.bfloat16, device=DEVICE)
+    packed, scale = quantize_weight_int4(w, group_size=128)
+    packed = packed.to(DEVICE)
+    scale  = scale.to(DEVICE)
+
+    # Reference: dequantize then matmul in bf16.
+    w_hat = dequantize_weight_int4(packed.cpu(), scale.cpu(), group_size=128).to(torch.bfloat16).to(DEVICE)
+    ref = a @ w_hat   # (1, d_out)
+
+    out = int4_matmul(a, packed, scale)   # should dispatch to GEMV path
+
+    rel_err = ((ref - out).norm() / (ref.norm() + 1e-8)).item()
+    assert rel_err < 0.05, f"GEMV rel_err={rel_err:.4f} for d_in={d_in} d_out={d_out}"
+
+
+def test_gemv_sign_extension_edges():
+    """Nibble sign-extension must be correct at boundary values 8→-8, 9→-7, 7→7."""
+    if DEVICE != "cuda":
+        pytest.skip("GEMV kernel is CUDA-only")
+    # Build a weight matrix where values hit the nibble boundaries.
+    # Use a single group (d_in=128, d_out=1) so we control the scale precisely.
+    d_in, d_out = 128, 64
+    # Force packed bytes that contain both high nibble = 8 (0x8) and low nibble = 9 (0x9).
+    # packed byte = (high << 4) | low = 0x89 (int8 = -119).
+    packed = torch.full((d_in // 2, d_out), 0x89, dtype=torch.uint8).to(torch.int8).to(DEVICE)
+    scale  = torch.ones(1, d_out, dtype=torch.float32, device=DEVICE)  # scale = 1.0
+
+    a = torch.ones(1, d_in, dtype=torch.bfloat16, device=DEVICE)   # all ones activation
+
+    out = int4_matmul(a, packed, scale)   # (1, d_out)
+
+    # high nibble 0x8 >> 4 as int8 = -8; low nibble 0x9 sign-extended = -7.
+    # Each output col = sum_{k=0}^{127}(a[k] * w[k]) = 64*(-8) + 64*(-7) = -512 + -448 = -960.
+    expected = (-8 + -7) * (d_in // 2)   # = -15 * 64 = -960
+    actual = out[0, 0].item()
+    assert abs(actual - expected) < 1.0, f"Sign-extension edge case: got {actual}, expected {expected}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_gemv_vs_matmul_dispatch():
+    """M=1 dispatches to GEMV; M=2 dispatches to tile matmul; outputs must agree."""
+    d_in, d_out = 512, 256
+    torch.manual_seed(99)
+    w = torch.randn(d_in, d_out)
+    packed, scale = quantize_weight_int4(w, group_size=128)
+    packed = packed.cuda()
+    scale  = scale.cuda()
+
+    a1 = torch.randn(1, d_in, dtype=torch.bfloat16, device="cuda")
+    a2 = torch.cat([a1, a1], dim=0)   # (2, d_in) — tile path
+
+    out1 = int4_matmul(a1, packed, scale)   # GEMV
+    out2 = int4_matmul(a2, packed, scale)   # tile; row 0 == row 1 since input is duplicated
+
+    rel = ((out1 - out2[:1]).norm() / (out1.norm() + 1e-8)).item()
+    assert rel < 0.01, f"GEMV and tile matmul disagree: rel={rel:.4f}"
