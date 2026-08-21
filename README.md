@@ -228,4 +228,4 @@ server.py                multi-session HTTP server (continuous batching, NDJSON 
 | ✦ | Fused INT4 Triton kernel (this session) |
 | 8 | Multi-session HTTP server (continuous batching) + CUDA graphs for decode |
 
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) and [`ROADMAP.md`](ROADMAP.md) for deeper notes.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/ROADMAP.md`](docs/ROADMAP.md) for deeper notes.
