@@ -355,11 +355,13 @@ class PagedLlamaKVCache:
         seq_lens_buf: torch.Tensor,
         capture_len: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Fixed-shape decode-step write + gather, safe to capture in a CUDA graph.
+        """Fixed-shape write + gather, safe to capture in a CUDA graph.
 
         Args:
-            k_new, v_new:    New keys/values for the single new decode token.
-                             Shape: (A, n_kv_heads, 1, head_dim)
+            k_new, v_new:    New keys/values. Shape: (A, n_kv_heads, q_len, head_dim).
+                             q_len=1 for decode steps; q_len=K+1 for verify steps.
+                             q_len is fixed at graph-capture time so the Python loop
+                             below unrolls into static CUDA ops.
             block_table_buf: (A, capture_len // block_size) physical block ids.
             seq_lens_buf:    (A,) each row's token count *before* this write.
             capture_len:     Fixed gather length for this bucket (a multiple
@@ -372,12 +374,13 @@ class PagedLlamaKVCache:
             raise ValueError(f"layer {layer} not owned by this cache ({self.owned_layers})")
         local_layer = layer - self.layer_offset
         bs = self.manager.block_size
-        block_idx = seq_lens_buf // bs                                    # (A,)
-        offset = seq_lens_buf % bs                                        # (A,)
-        phys = block_table_buf.gather(1, block_idx.unsqueeze(1)).squeeze(1)  # (A,)
-
-        self.k_pool[local_layer, phys, :, offset, :] = k_new[:, :, 0, :]
-        self.v_pool[local_layer, phys, :, offset, :] = v_new[:, :, 0, :]
+        q_len = k_new.shape[2]
+        for q in range(q_len):
+            block_idx_q = (seq_lens_buf + q) // bs                           # (A,)
+            offset_q    = (seq_lens_buf + q) % bs                            # (A,)
+            phys_q = block_table_buf.gather(1, block_idx_q.unsqueeze(1)).squeeze(1)  # (A,)
+            self.k_pool[local_layer, phys_q, :, offset_q, :] = k_new[:, :, q, :]
+            self.v_pool[local_layer, phys_q, :, offset_q, :] = v_new[:, :, q, :]
 
         n_blocks_cap = capture_len // bs
         phys_all = block_table_buf[:, :n_blocks_cap]                      # (A, n_blocks_cap)

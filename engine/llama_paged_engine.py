@@ -56,6 +56,42 @@ class _CapturedGraph:
     bucket_size: int
 
 
+@dataclass
+class _CapturedVerifyGraph:
+    """CUDA graph for a fixed (len_bucket, q_len) verify shape (batch=1 always)."""
+
+    graph: "torch.cuda.CUDAGraph"
+    input_ids: torch.Tensor          # (1, q_len) long — static
+    position_ids: torch.Tensor       # (1, q_len) long — static
+    block_table_buf: torch.Tensor    # (1, capture_len // block_size) long — static
+    seq_lens_buf: torch.Tensor       # (1,) long — static
+    attn_mask_buf: torch.Tensor      # (1, q_len, capture_len) bool — static
+    logits: torch.Tensor             # (1, q_len, vocab) — static output, captured
+    capture_len: int
+    q_len: int
+
+
+class _GraphVerifyCache:
+    """Like ``_GraphDecodeCache`` but for verify steps where q_len = K+1 > 1."""
+
+    def __init__(
+        self,
+        real_cache: PagedLlamaKVCache,
+        block_table_buf: torch.Tensor,
+        seq_lens_buf: torch.Tensor,
+        capture_len: int,
+    ) -> None:
+        self._real = real_cache
+        self.block_table_buf = block_table_buf
+        self.seq_lens_buf = seq_lens_buf
+        self.capture_len = capture_len
+
+    def extend(self, layer: int, k_new: torch.Tensor, v_new: torch.Tensor, start_pos: int = 0):
+        return self._real.extend_static(
+            layer, k_new, v_new, self.block_table_buf, self.seq_lens_buf, self.capture_len,
+        )
+
+
 class _GraphDecodeCache:
     """Adapter routing ``LlamaModel.forward``'s ``cache.extend(...)`` calls through
     ``PagedLlamaKVCache.extend_static`` against a fixed pair of static buffers —
@@ -165,6 +201,7 @@ class LlamaPagedEngine:
             graph_len_buckets or _default_graph_len_buckets(model.config.n_ctx, block_size)
         )
         self._graphs: dict[tuple[int, int], _CapturedGraph] = {}
+        self._verify_graphs: dict[tuple[int, int], _CapturedVerifyGraph] = {}
 
     # ------------------------------------------------------------------
     # Queue management
@@ -539,6 +576,81 @@ class LlamaPagedEngine:
         )                                                                # (1, K+1, vocab)
         # extend() advanced seq_lens[seq_id] by K1
         return logits[0]                                                 # (K+1, vocab)
+
+    def _capture_verify_graph(self, len_bucket: int, q_len: int, seq_id: int) -> _CapturedVerifyGraph:
+        block_table_buf, seq_lens_buf = self.cache.build_static_buffers(
+            [seq_id], 1, len_bucket, self.device
+        )
+        L = int(seq_lens_buf[0].item())
+        input_ids    = torch.zeros(1, q_len, dtype=torch.long, device=self.device)
+        position_ids = torch.arange(L, L + q_len, device=self.device).unsqueeze(0)
+        ar      = torch.arange(len_bucket, device=self.device)
+        q_abs   = position_ids[0]
+        attn_mask = (ar[None, :] <= q_abs[:, None])[None, :, :]           # (1, q_len, len_bucket)
+
+        wrapper = _GraphVerifyCache(self.cache, block_table_buf, seq_lens_buf, len_bucket)
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                self.model.forward(
+                    input_ids, cache=wrapper, start_pos=0,
+                    position_ids=position_ids, attn_mask=attn_mask,
+                )
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_logits = self.model.forward(
+                input_ids, cache=wrapper, start_pos=0,
+                position_ids=position_ids, attn_mask=attn_mask,
+            )
+
+        return _CapturedVerifyGraph(
+            graph=graph, input_ids=input_ids, position_ids=position_ids,
+            block_table_buf=block_table_buf, seq_lens_buf=seq_lens_buf,
+            attn_mask_buf=attn_mask, logits=static_logits,
+            capture_len=len_bucket, q_len=q_len,
+        )
+
+    @torch.no_grad()
+    def _step_verify_graphed(self, seq_id: int, verify_ids: list[int]) -> torch.Tensor:
+        """Graphed verify step; falls back to eager when CUDA graphs are off or bucket too large."""
+        if not self.enable_cuda_graphs:
+            return self._step_verify_eager(seq_id, verify_ids)
+
+        q_len = len(verify_ids)
+        L = self.cache.seq_lens[seq_id]
+        bucket = self._pick_bucket(1, L + q_len)
+        if bucket is None:
+            return self._step_verify_eager(seq_id, verify_ids)
+        _, len_bucket = bucket
+
+        vg = self._verify_graphs.get((len_bucket, q_len))
+        if vg is None:
+            vg = self._capture_verify_graph(len_bucket, q_len, seq_id)
+            self._verify_graphs[(len_bucket, q_len)] = vg
+
+        self.cache.ensure_slots_for(seq_id, q_len)
+        block_table_buf, seq_lens_buf = self.cache.build_static_buffers(
+            [seq_id], 1, len_bucket, self.device
+        )
+        vg.block_table_buf.copy_(block_table_buf)
+        vg.seq_lens_buf.copy_(seq_lens_buf)
+        vg.input_ids.copy_(torch.tensor([verify_ids], dtype=torch.long, device=self.device))
+        vg.position_ids.copy_(torch.arange(L, L + q_len, device=self.device).unsqueeze(0))
+        ar    = torch.arange(len_bucket, device=self.device)
+        q_abs = vg.position_ids[0]
+        vg.attn_mask_buf.copy_((ar[None, :] <= q_abs[:, None])[None, :, :])
+
+        vg.graph.replay()
+
+        # extend_static doesn't advance seq_lens — do it here, same as _step_one_graphed.
+        self.cache.seq_lens[seq_id] += q_len
+
+        return vg.logits[0]   # (q_len, vocab)
 
     @torch.no_grad()
     def step(self, now: float = 0.0) -> list[LlamaRequest]:

@@ -789,7 +789,7 @@ def main():
         cuda_graphs = (args.device == "cuda" and not args.compile)
 
     if draft_model is not None and cuda_graphs:
-        # Best path: spec decode with CUDA-graphed draft + eager verify target.
+        # Best path: spec decode with CUDA-graphed draft + graphed verify target.
         block_size = 16
         n_blocks = (args.max_ctx + block_size - 1) // block_size + 64
         target_engine = LlamaPagedEngine(
@@ -798,7 +798,7 @@ def main():
             block_size=block_size,
             eos_token=tokenizer.im_end_id,
             sampling=agent_kwargs["sampling"],
-            enable_cuda_graphs=False,   # target uses eager verify (q_len=K+1)
+            enable_cuda_graphs=True,    # target uses graphed verify (q_len=K+1)
         )
         draft_engine = LlamaPagedEngine(
             draft_model,

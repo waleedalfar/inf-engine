@@ -127,6 +127,73 @@ def test_greedy_spec_matches_standard(n_draft, prompt_len, max_new):
 
 
 # ---------------------------------------------------------------------------
+# Phase 3: graphed verify step
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs require CUDA")
+def test_step_verify_graphed_matches_eager():
+    """_step_verify_graphed must return logits identical to _step_verify_eager."""
+    cfg = _mini_config()
+    model = _mini_model(cfg, seed=42)
+    prompt = [1, 2, 3, 4, 5]
+    verify_ids = [10, 20, 30, 40, 50]  # q_len=5
+
+    # Eager engine
+    eager_engine = _make_paged_engine(model, n_blocks=200, block_size=16)
+    req_e = LlamaRequest(req_id=0, prompt_ids=prompt, max_new_tokens=20)
+    eager_engine._prefill(req_e, 0.0)
+    eager_logits = eager_engine._step_verify_eager(0, verify_ids)
+
+    # Graphed engine (same model — shares weights but independent cache)
+    graph_engine = LlamaPagedEngine(
+        model, n_total_blocks=200, block_size=16,
+        sampling=SamplingConfig(mode=SamplingMode.GREEDY),
+        enable_cuda_graphs=True,
+    )
+    req_g = LlamaRequest(req_id=0, prompt_ids=prompt, max_new_tokens=20)
+    graph_engine._prefill(req_g, 0.0)
+    graph_logits = graph_engine._step_verify_graphed(0, verify_ids)
+
+    assert eager_logits.shape == graph_logits.shape
+    torch.testing.assert_close(eager_logits, graph_logits, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs require CUDA")
+@pytest.mark.parametrize("n_draft", [1, 2, 4])
+@pytest.mark.parametrize("prompt_len,max_new", [(3, 8), (5, 4), (1, 10)])
+def test_greedy_spec_graphed_verify_matches_standard(n_draft, prompt_len, max_new):
+    """Graphed verify (Phase 3): spec decode with graphed target == standard greedy decode."""
+    cfg = _mini_config()
+    torch.manual_seed(0)
+    prompt = torch.randint(0, cfg.vocab_size, (prompt_len,)).tolist()
+
+    target_model = _mini_model(cfg, seed=42)
+    draft_model  = _mini_model(cfg, seed=7)
+
+    # Standard decode
+    std_engine = _make_paged_engine(target_model)
+    std_req = LlamaRequest(req_id=0, prompt_ids=prompt, max_new_tokens=max_new)
+    std_results = std_engine.run_offline([std_req])
+
+    # Spec decode with graphed verify on target
+    greedy = SamplingConfig(mode=SamplingMode.GREEDY)
+    t_engine = LlamaPagedEngine(target_model, n_total_blocks=200, block_size=16,
+                                eos_token=None, sampling=greedy, enable_cuda_graphs=True)
+    d_engine = LlamaPagedEngine(draft_model, n_total_blocks=200, block_size=16,
+                                eos_token=None, sampling=greedy, enable_cuda_graphs=True)
+    spec_engine = SpeculativePagedEngine(t_engine, d_engine, n_draft=n_draft, eos_token=None)
+    spec_req = LlamaRequest(req_id=0, prompt_ids=prompt, max_new_tokens=max_new)
+    spec_results, stats = spec_engine.run_offline([spec_req])
+
+    assert spec_results[0] == std_results[0], (
+        f"n_draft={n_draft}, prompt_len={prompt_len}, max_new={max_new}\n"
+        f"  spec (graphed verify): {spec_results[0]}\n"
+        f"  standard:              {std_results[0]}"
+    )
+    assert stats.n_steps > 0
+
+
+# ---------------------------------------------------------------------------
 # max_new_tokens is always respected
 # ---------------------------------------------------------------------------
 

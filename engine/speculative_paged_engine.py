@@ -1,18 +1,18 @@
 """Speculative decoding over paged KV caches with CUDA graphs.
 
 ``SpeculativePagedEngine`` wraps two ``LlamaPagedEngine`` instances (target and
-draft) and runs the Leviathan et al. accept/reject loop.  The draft model uses
-graphed single-token steps (``_step_one_graphed``); the target runs an eager
-K+1-token verify step (``_step_verify_eager``).
+draft) and runs the Leviathan et al. accept/reject loop.  Both draft and target
+use CUDA graphs: the draft model uses ``_step_one_graphed`` (q_len=1) and the
+target uses ``_step_verify_graphed`` (q_len=K+1).
 
 Architecture
 ------------
 - CUDA graph overhead is eliminated for the small draft model (≈0.28 GB INT4
   for Qwen3-0.6B) — each of the K draft steps is a graph replay instead of a
   full eager forward.
-- The verify step stays eager because it writes K+1 tokens per call (variable
-  q_len), which the current graph infrastructure doesn't support.  Phase 3
-  of the roadmap will extend ``extend_static`` to handle q_len > 1.
+- The verify step uses a separate graph family keyed by (len_bucket, q_len).
+  ``extend_static`` loops over q_len positions at capture time so the Python
+  loop unrolls into static CUDA ops.
 
 Correctness property (greedy)
 ------------------------------
@@ -49,7 +49,7 @@ class SpeculativePagedEngine:
 
     Args:
         target:   Fully loaded target ``LlamaPagedEngine`` (large model).
-                  ``enable_cuda_graphs`` can be False — verify is always eager.
+                  Set ``enable_cuda_graphs=True`` to use the graphed verify path.
         draft:    Fully loaded draft ``LlamaPagedEngine`` (small model).
                   Should have ``enable_cuda_graphs=True`` on CUDA for best
                   performance.
@@ -161,7 +161,7 @@ class SpeculativePagedEngine:
             # ── Verify phase ─────────────────────────────────────────────
             last_target_tok = int(target._active[t_sid][1].item())
             verify_ids = [last_target_tok] + draft_tokens       # K+1 tokens
-            t_logits = target._step_verify_eager(t_sid, verify_ids)  # (K+1, vocab)
+            t_logits = target._step_verify_graphed(t_sid, verify_ids)  # (K+1, vocab)
 
             # ── Accept / reject ──────────────────────────────────────────
             emitted: list[int] = []
