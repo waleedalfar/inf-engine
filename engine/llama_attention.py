@@ -8,10 +8,17 @@ Three differences from the GPT-2 attention (engine/attention.py):
 2. **RoPE** — rotary positional embeddings are applied to Q and K after
    projection; the precomputed cos/sin tables come from the model.
 
-3. **GQA** — ``repeat_kv`` expands the ``n_kv_heads`` KV tensors to ``n_head``
-   query heads before the scaled dot-product, so the rest of the attention math
-   is unchanged.  The KV cache stores only ``n_kv_heads`` to realize the memory
-   saving; expansion happens at attention time.
+3. **GQA** — on the *unmasked* SDPA calls (plain causal / decode-all-cached),
+   ``n_kv_heads``-width K/V go straight to
+   ``F.scaled_dot_product_attention(..., enable_gqa=True)`` instead of being
+   pre-expanded to ``n_head`` width first, letting the flash kernel read the
+   narrow K/V directly. When an explicit ``attn_mask`` is involved (continuous
+   batching / spec-decode verify), PyTorch's flash/mem-efficient backends
+   don't support ``enable_gqa`` + ``attn_mask`` together on this build and
+   silently fall back to the much slower reference "math" backend (measured:
+   masked decode got ~1.7x *slower* end to end) — those calls still
+   pre-expand via ``repeat_kv`` to keep hitting the fused efficient-attention
+   kernel. See the branch comments below for which case does which.
 """
 
 from __future__ import annotations
@@ -26,6 +33,9 @@ from engine.layers import apply_rope, linear, rms_norm
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """Expand KV heads to match Q heads for grouped-query attention.
+
+    Only used on the masked SDPA branches (see ``llama_attention`` below) —
+    ``enable_gqa=True`` handles the unmasked branches without this copy.
 
     Args:
         x:     KV tensor. Shape: (B, n_kv_heads, T, head_dim)
@@ -102,9 +112,7 @@ def llama_attention(
         k, v = cache.extend(layer_idx, k, v, start_pos)           # (B, n_kv_heads, T_total, d)
     T_total = k.shape[2]
 
-    # --- GQA: expand n_kv_heads → n_head before the dot-product ---
-    k_exp = repeat_kv(k, n_kv_groups)                             # (B, n_head, T_total, head_dim)
-    v_exp = repeat_kv(v, n_kv_groups)                             # (B, n_head, T_total, head_dim)
+    gqa = n_kv_groups != 1
 
     # --- SDPA — three cases based on T_q and cache state ---
     #
@@ -112,28 +120,35 @@ def llama_attention(
     # With a KV cache where T_total > T_q, this is WRONG — query i can only see
     # keys 0..i instead of keys 0..start_pos+i.
     #
-    # Case A — explicit mask provided (continuous batching).
+    # Case A — explicit mask provided (continuous batching): pre-expand K/V
+    #           (repeat_kv) — enable_gqa=True + attn_mask forces the slow
+    #           MATH backend on this torch build, so this branch avoids it.
     # Case B — decode step (T_q=1): all cached keys are already from earlier
-    #           positions; is_causal=False (attend to all of them).
+    #           positions; is_causal=False (attend to all of them). No mask,
+    #           so enable_gqa=True safely reaches the flash kernel.
     # Case C — full prefill without cached prefix (start_pos=0, T_q==T_total):
-    #           standard lower-triangular, is_causal=True is correct.
+    #           standard lower-triangular, is_causal=True is correct. No
+    #           mask, same as B.
     # Case D — multi-token forward with existing cache (spec verify phase):
     #           query i (abs pos start_pos+i) must see keys 0..start_pos+i.
-    #           Build "upper right" offset mask: mask[i][j] = (j <= i+start_pos).
+    #           Builds its own offset bias mask, so same MATH-fallback risk
+    #           as Case A — pre-expand here too.
     if attn_mask is not None:
+        k_exp, v_exp = repeat_kv(k, n_kv_groups), repeat_kv(v, n_kv_groups)
         out = F.scaled_dot_product_attention(
             q, k_exp, v_exp, attn_mask=attn_mask[:, None].bool()
         )
     elif T_q == 1:
-        out = F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=False)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=gqa)
     elif start_pos == 0:
-        out = F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=True)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=gqa)
     else:
         rows = torch.arange(T_q, device=q.device)
         cols = torch.arange(T_total, device=q.device)
         mask = cols[None, :] <= (rows[:, None] + start_pos)        # (T_q, T_total)
         bias = torch.zeros(1, 1, T_q, T_total, dtype=q.dtype, device=q.device)
         bias.masked_fill_(~mask[None, None], float("-inf"))
+        k_exp, v_exp = repeat_kv(k, n_kv_groups), repeat_kv(v, n_kv_groups)
         out = F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=bias)
 
     # --- merge heads and output projection ---

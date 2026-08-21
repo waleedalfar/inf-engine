@@ -154,6 +154,10 @@ class LlamaPagedEngine:
         self._active: dict[int, tuple[LlamaRequest, torch.Tensor]] = {}
         self._next_seq_id: int = 0
         self.completed: list[LlamaRequest] = []
+        # seq_id -> generated token ids (prompt excluded), for repetition
+        # penalty context — matches AgentLoop._generate_to_eos's rule that
+        # penalty only ever tracks generated tokens, never the prompt.
+        self._generated: dict[int, list[int]] = {}
 
         self.enable_cuda_graphs = enable_cuda_graphs and torch.device(device).type == "cuda"
         self.graph_batch_buckets = sorted(graph_batch_buckets or DEFAULT_GRAPH_BATCH_BUCKETS)
@@ -216,6 +220,7 @@ class LlamaPagedEngine:
         else:
             self.cache.ensure_slot(seq_id)
             self._active[seq_id] = (req, first.view(1).to(self.device))
+            self._generated[seq_id] = [int(first)]
         return done
 
     def _evict(self, seq_id: int, req: LlamaRequest, now: float) -> None:
@@ -223,6 +228,28 @@ class LlamaPagedEngine:
         self.completed.append(req)
         self._active.pop(seq_id)
         self.cache.free_sequence(seq_id)
+        self._generated.pop(seq_id, None)
+
+    def _repetition_context(self, seq_ids: list[int]) -> torch.Tensor | None:
+        """Build a padded (A, T) context-id tensor for the repetition penalty,
+        one row per active sequence's own generated tokens (prompt excluded).
+
+        Rows are padded on the left by repeating that sequence's own first
+        generated token — a real, already-correctly-penalized id, so padding
+        never introduces spurious penalties on an unrelated token (unlike
+        padding with a sentinel like 0, which would silently penalize
+        whatever real token id 0 happens to be for short sequences).
+        Returns None when repetition penalty is off (skips the tensor build).
+        """
+        if self.cfg.repetition_penalty == 1.0:
+            return None
+        max_len = max(len(self._generated[sid]) for sid in seq_ids)
+        rows = []
+        for sid in seq_ids:
+            gen = self._generated[sid]
+            pad = [gen[0]] * (max_len - len(gen))
+            rows.append(pad + gen)
+        return torch.tensor(rows, device=self.device)
 
     @torch.no_grad()
     def _decode_step(self, now: float) -> list[LlamaRequest]:
@@ -255,8 +282,11 @@ class LlamaPagedEngine:
             input_ids, cache=self.cache, start_pos=0,
             position_ids=position_ids, attn_mask=attn_mask,
         )                                                               # (A, 1, V)
-        nxt = sample_next_token(logits[:, -1, :], self.cfg)            # (A, 1)
+        context_ids = self._repetition_context(seq_ids)
+        nxt = sample_next_token(logits[:, -1, :], self.cfg, context_ids)  # (A, 1)
         tokens = nxt.view(-1).tolist()                                 # one GPU→CPU sync per step
+        for sid, tok in zip(seq_ids, tokens):
+            self._generated[sid].append(tok)
 
         completions: list[LlamaRequest] = []
         evict_ids: list[tuple[int, LlamaRequest]] = []
@@ -382,8 +412,14 @@ class LlamaPagedEngine:
         self._fill_graph_inputs(cg, seq_ids)
         cg.graph.replay()
 
-        nxt = sample_next_token(cg.logits[:A, -1, :], self.cfg)        # (A, 1) — fresh tensor
+        # cg.logits is a fresh tensor copied out of the graph's static output
+        # buffer on each replay — applying repetition penalty here (ordinary
+        # eager tensor ops, not part of the captured graph) is safe.
+        context_ids = self._repetition_context(seq_ids)
+        nxt = sample_next_token(cg.logits[:A, -1, :], self.cfg, context_ids)  # (A, 1)
         tokens = nxt.view(-1).tolist()                                 # one GPU→CPU sync per step
+        for sid, tok in zip(seq_ids, tokens):
+            self._generated[sid].append(tok)
 
         # extend_static doesn't touch self.cache.seq_lens (it works off the
         # static buffer, not the dict) — advance it here, same effect as the

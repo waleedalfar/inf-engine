@@ -16,7 +16,7 @@ import torch
 
 from engine.config import LlamaConfig
 from engine.kv_cache import LlamaStaticKVCache
-from engine.layers import precompute_rope_freqs, rms_norm
+from engine.layers import linear, precompute_rope_freqs, rms_norm
 from engine.llama_block import llama_block
 from engine.llama_weights import LlamaWeights
 from engine.sampling import SamplingConfig, sample_next_token
@@ -145,7 +145,7 @@ class LlamaModel:
 
         if is_last:
             x = rms_norm(x, self.w.norm_weight, self.config.norm_eps)  # (B, T_q, d_model)
-            logits = x @ self.w.lm_head.T                              # (B, T_q, vocab_size)
+            logits = linear(x, self.w.lm_head)                         # (B, T_q, vocab_size)
             return logits
         return x
 

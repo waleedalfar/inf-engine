@@ -158,6 +158,33 @@ class PagedLlamaKVCache:
         self.manager.free(self.block_table.pop(seq_id, []))
         self.seq_lens.pop(seq_id, None)
 
+    def reset_to(self, seq_id: int, pos: int) -> None:
+        """Roll back a sequence to ``pos`` filled tokens.
+
+        Blocks allocated strictly beyond ``pos`` are returned to the free pool.
+        Block data is NOT zeroed — the retained blocks still contain valid KV
+        values at positions < pos, which is exactly what we need for speculative
+        decoding rollback.
+
+        Args:
+            seq_id: Sequence to roll back.
+            pos:    New token count (must be ≤ current seq_len).
+        """
+        if seq_id not in self.seq_lens:
+            raise ValueError(f"reset_to: seq_id={seq_id} not allocated")
+        current = self.seq_lens[seq_id]
+        if pos < 0 or pos > current:
+            raise ValueError(f"reset_to: pos={pos} out of range [0, {current}]")
+        bs = self.manager.block_size
+        # Blocks needed to hold pos tokens (at least 1 so the sequence is never
+        # left with zero blocks, matching the invariant set by allocate_sequence).
+        keep = max(self.manager.blocks_needed(pos), 1)
+        excess = self.block_table[seq_id][keep:]
+        if excess:
+            self.manager.free(excess)
+            self.block_table[seq_id] = self.block_table[seq_id][:keep]
+        self.seq_lens[seq_id] = pos
+
     # ------------------------------------------------------------------
     # Per-step interface (call begin_step then model.forward)
     # ------------------------------------------------------------------

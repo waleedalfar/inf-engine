@@ -20,7 +20,12 @@ Peak extra memory = one layer's worth of weights in float (not all layers).
 
 Layers quantized (7 per block):
     q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
-NOT quantized: embed_tokens, lm_head, RMSNorm gains (small, precision-sensitive).
+NOT quantized by default: embed_tokens (lookup only, no benefit), lm_head,
+RMSNorm gains (small, precision-sensitive). ``lm_head`` can optionally be
+quantized too (``quantize_lm_head=True``) — for Qwen3-8B it's a full
+(151936, 4096) bf16 matmul run every decode step (~1.24GB streamed, ~25% on
+top of the quantized transformer body's 3.69GB), untied from embed_tokens,
+so it's a real decode-bandwidth cost with no attention/precision role.
 """
 
 from __future__ import annotations
@@ -96,7 +101,9 @@ class QuantizedLlamaWeights:
         return self._orig.embed_tokens
 
     @property
-    def lm_head(self) -> torch.Tensor:
+    def lm_head(self):
+        if "lm_head.weight" in self._int4:
+            return self._int4["lm_head.weight"]
         return self._orig.lm_head
 
     @property
@@ -155,12 +162,23 @@ class QuantizedLlamaWeights:
 def quantize_llama(
     model: LlamaModel,
     group_size: int = 128,
+    quantize_lm_head: bool = False,
 ) -> LlamaModel:
     """Quantize all linear projections in ``model`` to INT4 W4A16.
 
     Args:
-        model:      Loaded LlamaModel (any float dtype).
-        group_size: Rows per quantization group (128 is standard).
+        model:             Loaded LlamaModel (any float dtype).
+        group_size:        Rows per quantization group (128 is standard).
+        quantize_lm_head:  Also quantize the final unembedding projection
+                            (``lm_head.weight``). Skipped automatically when
+                            ``config.tie_word_embeddings`` is True (lm_head
+                            is just a view of embed_tokens there, which stays
+                            unquantized since it's a lookup, not a matmul) or
+                            when the model has no separate lm_head tensor.
+                            Off by default — quantizing the output projection
+                            has more direct effect on prediction quality than
+                            interior projections, so this is opt-in pending a
+                            quality check (see tests/test_int4_quant.py).
 
     Returns:
         New ``LlamaModel`` backed by ``QuantizedLlamaWeights``.  The original
@@ -173,6 +191,14 @@ def quantize_llama(
     int4: dict[str, _Int4Weight] = {}
     original_bytes = 0
     quantized_bytes = 0
+
+    if quantize_lm_head and not config.tie_word_embeddings and "lm_head.weight" in orig._t:
+        w = orig._t["lm_head.weight"]          # (vocab_size, d_model) Linear layout
+        w_col = w.T.contiguous()               # (d_model, vocab_size)
+        packed, scale = quantize_weight_int4(w_col.float(), group_size)
+        int4["lm_head.weight"] = _Int4Weight(packed, scale, group_size, tuple(w.shape))
+        original_bytes += w.numel() * w.element_size()
+        quantized_bytes += packed.numel() * packed.element_size() + scale.numel() * scale.element_size()
 
     for i in range(config.n_layer):
         prefix = f"model.layers.{i}."
