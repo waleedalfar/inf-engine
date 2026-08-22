@@ -41,6 +41,28 @@ class LlamaModel:
         )
         self.rope_cos = cos  # (n_ctx, head_dim)
         self.rope_sin = sin  # (n_ctx, head_dim)
+        self._rope_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def _rope_tables(
+        self, device: torch.device, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """RoPE cos/sin tables in ``dtype`` on ``device``, cast once and reused.
+
+        The tables are stored in float32 for precision but the forward pass wants
+        them in the activation dtype. Casting per call re-reads and rewrites the
+        whole (n_ctx, head_dim) table every forward — for a 40960-context model
+        that is ~20 MB of pointless traffic in two kernels, and it lands inside
+        every captured CUDA graph.
+        """
+        key = (str(device), dtype)
+        tables = self._rope_cache.get(key)
+        if tables is None:
+            tables = (
+                self.rope_cos.to(device=device, dtype=dtype),
+                self.rope_sin.to(device=device, dtype=dtype),
+            )
+            self._rope_cache[key] = tables
+        return tables
 
     @torch.no_grad()
     def forward(
@@ -132,9 +154,7 @@ class LlamaModel:
                 start_pos, start_pos + T_q, device=x.device
             )                                                           # (T_q,)
 
-        # Cast RoPE tables to the weight dtype and move to the right device once.
-        cos = self.rope_cos.to(device=x.device, dtype=x.dtype)
-        sin = self.rope_sin.to(device=x.device, dtype=x.dtype)
+        cos, sin = self._rope_tables(x.device, x.dtype)
 
         for i in range(start_layer, end_layer):
             x = llama_block(

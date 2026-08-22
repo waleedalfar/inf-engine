@@ -269,6 +269,7 @@ def quantize_llama(
     q_model.config = config
     q_model.rope_cos = model.rope_cos
     q_model.rope_sin = model.rope_sin
+    q_model._rope_cache = {}
     return q_model
 
 
@@ -292,6 +293,7 @@ def quantized_to_device(model: LlamaModel, device: str) -> LlamaModel:
 
     model.rope_cos = model.rope_cos.to(device)
     model.rope_sin = model.rope_sin.to(device)
+    model._rope_cache = {}    # cached casts point at the old device
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

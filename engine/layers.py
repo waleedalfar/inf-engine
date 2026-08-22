@@ -8,6 +8,7 @@ from __future__ import annotations
 import torch
 
 from engine.kernels.rms_norm import MAX_FUSED_COLS, triton_rms_norm
+from engine.kernels.rope import triton_rope
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -104,9 +105,14 @@ def apply_rope(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply rotary positional embeddings to Q and K in-place style.
 
+    Q and K are token-major here — (B, T, heads, head_dim) — so the fused CUDA
+    kernel sees each head vector as a contiguous row. RoPE is elementwise over
+    head_dim with the angle chosen by token position, so the head/token axis
+    order is irrelevant to the math.
+
     Args:
-        q:            Query vectors.  Shape: (B, n_head,    T, head_dim)
-        k:            Key vectors.    Shape: (B, n_kv_heads, T, head_dim)
+        q:            Query vectors.  Shape: (B, T, n_head,     head_dim)
+        k:            Key vectors.    Shape: (B, T, n_kv_heads, head_dim)
         cos:          Precomputed cos table. Shape: (max_seq, head_dim)
         sin:          Precomputed sin table. Shape: (max_seq, head_dim)
         position_ids: Token positions. Shape: (T,) or (B, T).
@@ -114,12 +120,22 @@ def apply_rope(
     Returns:
         (q_rot, k_rot) with the same shapes as input.
     """
+    if q.is_cuda and cos.is_cuda:
+        # The kernel indexes the tables on-device, so position_ids has to live
+        # there too — callers building it on the host would otherwise fault.
+        if position_ids.device != q.device:
+            position_ids = position_ids.to(q.device)
+        return (
+            triton_rope(q, cos, sin, position_ids),
+            triton_rope(k, cos, sin, position_ids),
+        )
+
     if position_ids.dim() == 1:
-        c = cos[position_ids][None, None]   # (1, 1, T, head_dim)
-        s = sin[position_ids][None, None]
+        c = cos[position_ids][None, :, None]   # (1, T, 1, head_dim)
+        s = sin[position_ids][None, :, None]
     else:
-        c = cos[position_ids][:, None]      # (B, 1, T, head_dim)
-        s = sin[position_ids][:, None]
+        c = cos[position_ids][:, :, None]      # (B, T, 1, head_dim)
+        s = sin[position_ids][:, :, None]
     q_rot = q * c + _rotate_half(q) * s
     k_rot = k * c + _rotate_half(k) * s
     return q_rot, k_rot

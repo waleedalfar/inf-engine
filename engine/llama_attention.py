@@ -119,13 +119,15 @@ def llama_attention(
         q = rms_norm(q, weights["self_attn.q_norm.weight"], config.norm_eps)
         k = rms_norm(k, weights["self_attn.k_norm.weight"], config.norm_eps)
 
+    # --- RoPE: rotate Q and K by their absolute positions ---
+    # Also applied token-major, for the same reason as QK-norm above: each head
+    # vector is one contiguous row, which is what the fused kernel wants.
+    q, k = apply_rope(q, k, cos, sin, position_ids)
+
     # --- to (B, heads, T, head_dim) for attention ---
     q = q.transpose(1, 2)                                          # (B, n_head,     T_q, head_dim)
     k = k.transpose(1, 2)                                          # (B, n_kv_heads, T_q, head_dim)
     v = v.transpose(1, 2)                                          # (B, n_kv_heads, T_q, head_dim)
-
-    # --- RoPE: rotate Q and K by their absolute positions ---
-    q, k = apply_rope(q, k, cos, sin, position_ids)
 
     # --- KV cache: append new K/V (stored at n_kv_heads), retrieve full history ---
     if cache is not None:

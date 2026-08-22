@@ -169,6 +169,7 @@ class LlamaMoEOffloadModel:
         )
         self.rope_cos = cos
         self.rope_sin = sin
+        self._rope_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
     @torch.no_grad()
     def forward(
