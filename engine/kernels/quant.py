@@ -306,23 +306,30 @@ def _int4_gemv_kernel(
     tl.store(C + offs_n, acc.to(tl.bfloat16), mask=n_mask)
 
 
-def _decode_launch_config(n: int, k: int) -> tuple[int, int]:
-    """(BLOCK_N, num_warps) for decode-shaped (M<=16) INT4 matmuls.
+def _decode_launch_config(n: int, k: int) -> tuple[int, int, int]:
+    """(BLOCK_N, num_warps, num_stages) for decode-shaped (M<=16) INT4 matmuls.
 
-    Smaller BLOCK_N launches more blocks → higher SM occupancy → better HBM
-    latency hiding (the dominant cost at M=1 decode). BLOCK_N=16 is the tensor-
-    core minimum on bf16 (16×16×16 WMMA tile); going below loses tensor cores.
-    num_warps=4 keeps the register file small enough that each SM can host
-    multiple concurrent blocks.
+    Tuned by sweeping BLOCK_N × num_warps × num_stages over the real Qwen3-8B
+    projection shapes at M=5 (the speculative verify shape) on an RTX 5070 Ti;
+    see the achieved weight-streaming bandwidths noted per branch below.
+
+    The earlier "smaller BLOCK_N → more blocks → better latency hiding" rule
+    over-corrected. Each block streams BLOCK_N columns of packed INT4, so a
+    small BLOCK_N also makes each block's HBM reads narrower and leaves the
+    memory system with too few wide requests in flight. Measured, wider tiles
+    win everywhere — most dramatically on the narrow k/v projections.
     """
     if n <= 2048:
-        block_n = 16
-    elif n <= 8192:
-        block_n = 32
-    else:
-        block_n = 64
-    num_warps = 4
-    return block_n, num_warps
+        # Narrow projections (k/v: N=1024). Deeply occupancy-starved either way
+        # — only n/BLOCK_N blocks exist — but BLOCK_N=32 nearly halves the time
+        # vs. 16 (68 → 98 GB/s). Fusing q/k/v into one matmul would help far
+        # more than any tile choice here.
+        return 32, 4, 2
+    if n <= 8192:
+        return 64, 8, 3          # q/o/down (N=4096): ~315 GB/s
+    if n <= 65536:
+        return 64, 4, 3          # gate/up (N=12288): ~515 GB/s
+    return 128, 4, 3             # lm_head (N=151936): ~630 GB/s
 
 
 def int4_matmul(
@@ -353,7 +360,7 @@ def int4_matmul(
     m, k = a.shape
     _, n = packed.shape
     c = torch.empty((m, n), device=a.device, dtype=a.dtype)
-    block_n, num_warps = _decode_launch_config(n, k)
+    block_n, num_warps, num_stages = _decode_launch_config(n, k)
     grid = (triton.cdiv(m, 16), triton.cdiv(n, block_n))
     _int4_matmul_kernel[grid](
         a, packed, scale, c,
@@ -362,7 +369,8 @@ def int4_matmul(
         packed.stride(0), packed.stride(1),
         scale.stride(0), scale.stride(1),
         c.stride(0), c.stride(1),
-        GROUP_SIZE=128, BLOCK_M=16, BLOCK_N=block_n, num_warps=num_warps,
+        GROUP_SIZE=128, BLOCK_M=16, BLOCK_N=block_n,
+        num_warps=num_warps, num_stages=num_stages,
     )
     return c
 
