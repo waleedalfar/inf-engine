@@ -47,6 +47,10 @@ _LINEAR_SUFFIXES = (
     "mlp.gate_proj.weight",
     "mlp.up_proj.weight",
     "mlp.down_proj.weight",
+    # Present instead of the q/k/v and gate/up entries above once
+    # engine/fuse_weights.fuse_projections has run.
+    "self_attn.qkv_proj.weight",
+    "mlp.gate_up_proj.weight",
 )
 
 # MoE expert projection names (relative to each expert prefix).

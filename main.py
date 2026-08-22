@@ -33,6 +33,7 @@ from engine.config import (
     QWEN3_0_6B, QWEN3_1_7B, QWEN3_4B, QWEN3_8B, QWEN3_14B, QWEN3_32B,
     QWEN3_30B_A3B, LlamaConfig,
 )
+from engine.fuse_weights import fuse_projections
 from engine.kv_cache import LlamaStaticKVCache
 from engine.llama_model import LlamaModel
 from engine.llama_moe_model import load_moe_weights, load_moe_weights_disk
@@ -565,6 +566,9 @@ def load_model(
         if quantize:
             vram = torch.cuda.memory_allocated() / 1e9 if device == "cuda" else 0
             print(f"Quantization done — {vram:.1f} GB VRAM in use")
+        # Concatenate q/k/v and gate/up into single wide projections — same
+        # math, but one well-occupied matmul each instead of narrow ones.
+        model = fuse_projections(model)
     print(f"Model ready: {config.name} on {device}")
     return model
 

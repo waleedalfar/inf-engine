@@ -89,15 +89,27 @@ def llama_attention(
     n_head, n_kv_heads, head_dim = config.n_head, config.n_kv_heads, config.head_dim
     n_kv_groups = config.n_kv_groups
 
-    # --- separate Q / K / V projections (nn.Linear layout: weight is d_out × d_in) ---
-    q = linear(x, weights["self_attn.q_proj.weight"])              # (B, T_q, d_model)
-    k = linear(x, weights["self_attn.k_proj.weight"])              # (B, T_q, n_kv_heads*head_dim)
-    v = linear(x, weights["self_attn.v_proj.weight"])              # (B, T_q, n_kv_heads*head_dim)
+    # --- Q / K / V projections (nn.Linear layout: weight is d_out × d_in) ---
+    # engine/fuse_weights.py concatenates the three into one wide projection at
+    # load time; splitting the result here is free (a view), whereas three
+    # separate matmuls over the same x leave the GPU badly under-occupied on the
+    # narrow K/V shapes. Falls back to separate weights when not fused.
+    qkv_w = weights.get("self_attn.qkv_proj.weight")
+    if qkv_w is not None:
+        qkv = linear(x, qkv_w)                                     # (B, T_q, (n_head+2*n_kv)*head_dim)
+        q_width, kv_width = n_head * head_dim, n_kv_heads * head_dim
+        q, k, v = qkv.split([q_width, kv_width, kv_width], dim=-1)
+    else:
+        q = linear(x, weights["self_attn.q_proj.weight"])          # (B, T_q, d_model)
+        k = linear(x, weights["self_attn.k_proj.weight"])          # (B, T_q, n_kv_heads*head_dim)
+        v = linear(x, weights["self_attn.v_proj.weight"])          # (B, T_q, n_kv_heads*head_dim)
 
     # --- split into heads, still token-major: (B, T, heads, head_dim) ---
-    q = q.view(B, T_q, n_head,     head_dim)
-    k = k.view(B, T_q, n_kv_heads, head_dim)
-    v = v.view(B, T_q, n_kv_heads, head_dim)
+    # reshape, not view: after a fused-QKV split these are slices of a wider
+    # row, so at T_q > 1 they are views rather than contiguous blocks.
+    q = q.reshape(B, T_q, n_head,     head_dim)
+    k = k.reshape(B, T_q, n_kv_heads, head_dim)
+    v = v.reshape(B, T_q, n_kv_heads, head_dim)
 
     # --- QK-norm (Qwen3): per-head RMSNorm on Q and K before RoPE ---
     # Applied here rather than after the transpose below: RMSNorm reduces over

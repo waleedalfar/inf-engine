@@ -27,7 +27,15 @@ def swiglu_mlp(x: torch.Tensor, weights: dict[str, torch.Tensor]) -> torch.Tenso
     Returns:
         MLP output to add back to the residual. Shape: (B, T, d_model)
     """
-    gate = linear(x, weights["mlp.gate_proj.weight"])              # (B, T, intermediate_size)
-    up   = linear(x, weights["mlp.up_proj.weight"])                # (B, T, intermediate_size)
-    h    = silu(gate) * up                                         # (B, T, intermediate_size)
+    # engine/fuse_weights.py concatenates gate and up into one projection at
+    # load time — both read the same x, so one wide matmul beats two narrow
+    # ones. Falls back to the separate weights when not fused.
+    gate_up_w = weights.get("mlp.gate_up_proj.weight")
+    if gate_up_w is not None:
+        gate_up = linear(x, gate_up_w)                             # (B, T, 2*intermediate_size)
+        gate, up = gate_up.chunk(2, dim=-1)                        # (B, T, intermediate_size) each
+    else:
+        gate = linear(x, weights["mlp.gate_proj.weight"])          # (B, T, intermediate_size)
+        up   = linear(x, weights["mlp.up_proj.weight"])            # (B, T, intermediate_size)
+    h = silu(gate) * up                                            # (B, T, intermediate_size)
     return linear(h, weights["mlp.down_proj.weight"])              # (B, T, d_model)
