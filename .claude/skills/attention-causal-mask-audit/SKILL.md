@@ -1,6 +1,6 @@
 ---
 name: attention-causal-mask-audit
-description: Use when a KV-cached transformer (this engine's LLaMA/Qwen3 attention, or any similar hand-rolled attention) produces coherent output on the first token then degenerates into garbage/repetition, when speculative-decoding accept rate is near 0%, or when adding/changing any `is_causal=True` call site near a KV cache. Also use BEFORE adding or strengthening any custom sampling-side penalty (repetition penalty, frequency penalty, or similar) to fight a degenerate-generation symptom — read the "diagnose before patching" section first. Diagnoses and prevents the PyTorch SDPA "upper-left causal mask" pitfall, and documents why a custom exponential repetition penalty was tried and reverted in favor of the standard flat/windowed approach.
+description: Use when a KV-cached transformer (this engine's LLaMA/Qwen3 attention, or any similar hand-rolled attention) produces coherent output on the first token then degenerates into garbage/repetition, when speculative-decoding accept rate is near 0%, or when adding/changing any `is_causal=True` call site near a KV cache. **Also use before writing or modifying any custom attention kernel** (flash-decoding, split-KV, paged gather) — offset-causal masking and padded-block handling are the two ways these silently produce plausible-looking wrong logits. Also use BEFORE adding or strengthening any custom sampling-side penalty (repetition penalty, frequency penalty, or similar) to fight a degenerate-generation symptom — read the "diagnose before patching" section first. Covers the PyTorch SDPA "upper-left causal mask" pitfall, KV-cache corruption through padded block-table columns, and why a custom exponential repetition penalty was tried and reverted.
 ---
 
 # Attention causal-mask audit
@@ -91,6 +91,51 @@ else:
 ```
 
 Reference implementation: `engine/llama_attention.py`.
+
+## Second bug class: writing KV through padded block-table columns
+
+`PagedLlamaKVCache.build_static_buffers` pads block-table columns beyond a
+sequence's allocated block count by **repeating that sequence's own block 0**.
+That is fine for *reads* — `attn_mask` hides the unwritten positions — but a
+forward that **writes** KV through a padded column lands on the sequence's real
+positions `0..block_size-1` and destroys its prompt.
+
+CUDA-graph *capture* writes: the warmup forwards run the real model against the
+real pool. So capturing a graph before allocating its slots corrupts the
+sequence. This shipped (fixed 2026-08-22) in `_step_verify_graphed`, which
+captured before calling `ensure_slots_for`.
+
+**Symptom:** output tracks a greedy baseline for ~10 tokens, then collapses into
+a repetition loop — and only when generation is long enough to need a *new*
+`(len_bucket, q_len)` graph. Accept rate stays healthy-looking (77%), because the
+draft and target agree on the same wrong continuation.
+
+**Guard:** `build_static_buffers(..., write_len=N)` raises when the caller has
+not allocated the N positions it is about to write. Pass it from every path that
+writes. Allocate before capture, never after.
+
+**Test rule:** any test meant to catch this must generate enough tokens to cross
+a `len_bucket` boundary (>`block_size` × several) and assert
+`len(engine._verify_graphs) > 1`. The pre-existing suite generated ≤15 tokens
+with `block_size=16` and never crossed one, which is why it passed for weeks.
+
+## Custom attention kernels: extra obligations
+
+When writing a flash-decoding / split-KV / paged-gather kernel, the two rules
+above become kernel-internal invariants rather than call-site choices:
+
+- [ ] **Offset-causal**: query row `i` admits keys `0..start_pos+i`. Test at
+      `start_pos > 0` specifically — an upper-left mask passes every
+      `start_pos == 0` test.
+- [ ] **True-length bound**: bucket/padding positions must be excluded
+      independently of the causal bound. A kernel that masks only causally will
+      happily attend to whatever garbage the padded blocks hold.
+- [ ] **Split-KV combine**: the log-sum-exp merge must handle a chunk in which
+      *every* position is masked (all `-inf`) without producing NaN — this
+      happens whenever a chunk lies entirely beyond the true length.
+- [ ] Validate against `F.scaled_dot_product_attention` with an explicit bool
+      mask at several `(start_pos, q_len, kv_len)` combinations, including
+      `kv_len` not a multiple of the KV chunk size.
 
 ## Audit checklist when touching attention/KV-cache code
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+from torch.nn.attention.bias import causal_lower_right
 
 from engine.config import LlamaConfig
 from engine.kv_cache import LlamaStaticKVCache
@@ -153,8 +154,16 @@ def llama_attention(
     #           mask, same as B.
     # Case D — multi-token forward with existing cache (spec verify phase):
     #           query i (abs pos start_pos+i) must see keys 0..start_pos+i.
-    #           Builds its own offset bias mask, so same MATH-fallback risk
-    #           as Case A — pre-expand here too.
+    #           That is exactly PyTorch's "lower right" causal bias when the
+    #           gathered history is the true length (T_total == start_pos+T_q):
+    #           causal_lower_right(T_q, T_total) admits keys
+    #           0..T_total-T_q+i == 0..start_pos+i. Unlike an explicit mask
+    #           tensor it reaches the flash backend AND supports enable_gqa, so
+    #           K/V are never expanded — measured 6.7x faster than the
+    #           repeat_kv + bool-mask form at (q_len=5, kv=8192), and equal to
+    #           the no-mask ceiling. Falls back to the explicit bias when the
+    #           history is padded past the true length (captured CUDA graphs
+    #           gather a fixed len_bucket, so lower-right would be misaligned).
     if attn_mask is not None:
         k_exp, v_exp = repeat_kv(k, n_kv_groups), repeat_kv(v, n_kv_groups)
         out = F.scaled_dot_product_attention(
@@ -164,6 +173,10 @@ def llama_attention(
         out = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=gqa)
     elif start_pos == 0:
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=gqa)
+    elif T_total == start_pos + T_q:
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=causal_lower_right(T_q, T_total), enable_gqa=gqa
+        )
     else:
         rows = torch.arange(T_q, device=q.device)
         cols = torch.arange(T_total, device=q.device)

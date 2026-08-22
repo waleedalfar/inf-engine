@@ -193,8 +193,19 @@ active batch size and per-sequence KV length, so `LlamaPagedEngine` buckets both
 Each `(batch_bucket, len_bucket)` pair captures its own graph lazily on first use (3x warmup
 on a side stream, then `torch.cuda.graph(...)`). Padding batch rows redundantly repeat the last
 real row (discarded before sampling); padding KV columns repeat block 0 (hidden from attention
-by the length-derived mask) — both harmless. A decode step whose shape doesn't fit any
-configured bucket falls back to the eager path automatically.
+by the length-derived mask). A decode step whose shape doesn't fit any configured bucket falls
+back to the eager path automatically.
+
+> **Column padding is safe for reads only.** It aliases the sequence's own block 0, so a
+> forward that *writes* KV through a padded column corrupts that sequence's positions
+> `0..block_size-1`. Graph *capture* writes (warmup forwards), so callers must allocate before
+> capturing; `build_static_buffers(..., write_len=N)` enforces this. This was a real bug
+> (fixed 2026-08-22) that silently destroyed prompts whenever a new bucket was first used
+> mid-generation.
+
+> **Power-of-two `len_bucket`s are a short-context artifact.** Attention cost scales with the
+> captured bucket, not the true length, so at long context they waste up to 2× of the dominant
+> term. Being replaced — see [CLAUDE.md](../CLAUDE.md).
 
 ```python
 engine = LlamaPagedEngine(

@@ -595,13 +595,12 @@ class LlamaPagedEngine:
         self.cache.begin_step([seq_id])
         ids = _as_id_row(verify_ids, self.device)                       # (1, K+1)
         pos_ids = torch.arange(L, L + K1, device=self.device).unsqueeze(0)  # (1, K+1)
-        T_total = L + K1
-        ar = torch.arange(T_total, device=self.device)
-        q_abs = pos_ids[0]                                              # (K+1,)
-        attn_mask = (ar[None, :] <= q_abs[:, None])[None, :, :]        # (1, K+1, T_total) causal
+        # No explicit attn_mask: cache.extend() gathers exactly L+K1 positions,
+        # so llama_attention's lower-right causal branch applies — same mask,
+        # but it reaches the flash backend with GQA instead of materializing an
+        # expanded K/V. start_pos carries the offset the mask is built from.
         logits = self.model.forward(
-            ids, cache=self.cache, start_pos=0,
-            position_ids=pos_ids, attn_mask=attn_mask,
+            ids, cache=self.cache, start_pos=L, position_ids=pos_ids,
         )                                                                # (1, K+1, vocab)
         # extend() advanced seq_lens[seq_id] by K1
         return logits[0]                                                 # (K+1, vocab)

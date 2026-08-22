@@ -48,12 +48,16 @@ even row, low nibble = odd row). Decode uses arithmetic right-shift sign extensi
 
 ### FlashAttention2 prefill (SDPA)
 
-`engine/llama_attention.py` dispatches all attention through `F.scaled_dot_product_attention`,
-which selects FlashAttention2 on sm_80+ GPUs. FA2 eliminates the O(N²) score matrix:
-at 8K context, the naive score tensor is `8192² × 32 heads × 2 bytes ≈ 4 GB` — FA2
-uses O(N) HBM instead. Single-token decode also goes through SDPA (FA2 decode mode),
-ensuring speculative decoding's verify and decode steps use the same kernel, preserving
-the mathematical correctness guarantee.
+`engine/llama_attention.py` dispatches attention through `F.scaled_dot_product_attention`,
+which eliminates the O(N²) score matrix: at 8K context the naive score tensor is
+`8192² × 32 heads × 2 bytes ≈ 4 GB`, versus O(N) HBM for the fused kernels.
+
+> **SDPA does not reach the flash backend on the masked paths.** PyTorch's flash kernel
+> rejects arbitrary `attn_mask`, so continuous batching and speculative verify land on the
+> mem-efficient backend — which is poor at 1–5 row queries and, combined with `enable_gqa`
+> being unusable there, forces K/V to be expanded 4× first. Measured ~25× off the memory
+> bandwidth floor at 4K context. This is the main obstacle to long-context throughput and is
+> being replaced by a custom flash-decoding kernel — see [CLAUDE.md](CLAUDE.md).
 
 Add `--compile` to wrap `model.forward` with `torch.compile(mode='reduce-overhead')`
 for an additional 10–30% decode speedup after a one-time ~60s compilation.
@@ -72,7 +76,12 @@ memory overhead per step regardless of batch size.
 
 `SpeculativeDecoder` runs a small draft model K steps ahead, then verifies all K tokens
 in a single target-model forward pass. When the draft is right, you get K tokens for
-the cost of ~1. Typical acceptance rate 70–90% on coding tasks → **2–4× effective tok/s**.
+the cost of ~1. Typical acceptance rate 70–90% on coding tasks.
+
+**Measured (Qwen3-8B INT4 + Qwen3-0.6B draft, RTX 5070 Ti):** ~104 tok/s at 239-token
+context, falling to ~17 tok/s at 4200. Throughput here is strongly context-dependent, so
+every figure needs its context length attached; see [CLAUDE.md](CLAUDE.md) for the
+long-context targets and the work to reach them.
 
 ### GQA-aware KV cache
 
