@@ -59,19 +59,23 @@ NEG_INF = tl.constexpr(float("-inf"))
 
 @triton.jit
 def _paged_flash_decode_kernel(
-    Q, KPool, VPool, BlockTable, KVLens,
+    Q, KPool, VPool, KScale, VScale, BlockTable, KVLens,
     OutAcc, OutLse,
     scale,
     stride_qb, stride_qh, stride_qt,
     stride_kp_blk, stride_kp_h, stride_kp_pos,
+    stride_ks_blk, stride_ks_h, stride_ks_pos,
     stride_bt_b,
     stride_oa_b, stride_oa_h, stride_oa_s, stride_oa_m,
     stride_ol_b, stride_ol_h, stride_ol_s,
+    stride_o_b, stride_o_h, stride_o_t,
     q_len, n_rep, split_len, head_dim,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     PAGE: tl.constexpr,
+    SINGLE_SPLIT: tl.constexpr,
+    FP8_KV: tl.constexpr,
 ):
     """One program = (batch, kv_head, kv_split). Emits a normalized partial + lse."""
     b = tl.program_id(0)
@@ -123,7 +127,20 @@ def _paged_flash_decode_kernel(
         k = tl.load(KPool + kv_off, mask=kv_mask, other=0.0)
         v = tl.load(VPool + kv_off, mask=kv_mask, other=0.0)
 
-        qk = tl.dot(q, tl.trans(k), allow_tf32=False).to(tl.float32) * scale                      # (BLOCK_M, BLOCK_N)
+        if FP8_KV:
+            # Per-(position, head) scales, so dequantization folds into work we
+            # already do: K's scale is a per-key column factor on the scores,
+            # and V's is a per-row factor applied before the second dot. Neither
+            # needs a separate pass over the tile.
+            s_off = (blk * stride_ks_blk + h_kv * stride_ks_h + off * stride_ks_pos)
+            ks = tl.load(KScale + s_off, mask=in_range, other=0.0)
+            vs = tl.load(VScale + s_off, mask=in_range, other=0.0)
+            k = k.to(tl.float32)
+            v = (v.to(tl.float32) * vs[:, None]).to(q.dtype)
+            qk = tl.dot(q.to(tl.float32), tl.trans(k), allow_tf32=False)
+            qk = qk * ks[None, :] * scale
+        else:
+            qk = tl.dot(q, tl.trans(k), allow_tf32=False).to(tl.float32) * scale                      # (BLOCK_M, BLOCK_N)
         # Offset-causal: key j admitted iff j <= q_pos. Subsumes j < kv_len.
         admit = in_range[None, :] & (pos[None, :] <= q_pos[:, None])
         qk = tl.where(admit, qk, NEG_INF)
@@ -144,13 +161,21 @@ def _paged_flash_decode_kernel(
     # is a plain lse-weighted average.
     l_safe = tl.where(l_i == 0.0, 1.0, l_i)
     acc = acc / l_safe[:, None]
-    lse = tl.where(l_i == 0.0, NEG_INF, m_i + tl.log(l_safe))
 
-    oa = (OutAcc + b * stride_oa_b + h_kv * stride_oa_h + s * stride_oa_s
-          + offs_m[:, None] * stride_oa_m + offs_d[None, :])
-    tl.store(oa, acc, mask=row_valid[:, None] & d_valid[None, :])
-    ol = OutLse + b * stride_ol_b + h_kv * stride_ol_h + s * stride_ol_s + offs_m
-    tl.store(ol, lse, mask=row_valid)
+    if SINGLE_SPLIT:
+        # Nothing to merge — write the final answer and skip the combine launch.
+        # At short context that launch is a large share of total attention time.
+        op = (OutAcc + b * stride_o_b + (h_kv * n_rep + rep)[:, None] * stride_o_h
+              + tok[:, None] * stride_o_t + offs_d[None, :])
+        tl.store(op, acc.to(OutAcc.dtype.element_ty),
+                 mask=row_valid[:, None] & d_valid[None, :])
+    else:
+        lse = tl.where(l_i == 0.0, NEG_INF, m_i + tl.log(l_safe))
+        oa = (OutAcc + b * stride_oa_b + h_kv * stride_oa_h + s * stride_oa_s
+              + offs_m[:, None] * stride_oa_m + offs_d[None, :])
+        tl.store(oa, acc, mask=row_valid[:, None] & d_valid[None, :])
+        ol = OutLse + b * stride_ol_b + h_kv * stride_ol_h + s * stride_ol_s + offs_m
+        tl.store(ol, lse, mask=row_valid)
 
 
 @triton.jit
@@ -216,6 +241,25 @@ def _pick_splits(kv_len: int, n_ctas_per_split: int, target_ctas: int = 512) -> 
     return max(1, min(want, triton.cdiv(kv_len, 128), 64))
 
 
+_SCRATCH: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _scratch(key: tuple, acc_shape: tuple, lse_shape: tuple, device) -> tuple:
+    """Reusable per-shape workspace for the split partials.
+
+    Allocating these per call showed up as real cost at short context, where
+    there is little KV to read. Holding them in a module-level cache is also
+    what CUDA-graph capture wants: the pointers are baked into the graph at
+    capture time, and a live reference here keeps them from being freed.
+    """
+    buf = _SCRATCH.get(key)
+    if buf is None:
+        buf = (torch.empty(acc_shape, device=device, dtype=torch.float32),
+               torch.empty(lse_shape, device=device, dtype=torch.float32))
+        _SCRATCH[key] = buf
+    return buf
+
+
 def paged_flash_attention(
     q: torch.Tensor,
     k_pool: torch.Tensor,
@@ -224,6 +268,8 @@ def paged_flash_attention(
     kv_lens: torch.Tensor,
     *,
     page_size: int,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
     n_splits: int | None = None,
     block_n: int = 64,
 ) -> torch.Tensor:
@@ -239,6 +285,10 @@ def paged_flash_attention(
         kv_lens:     ``(B,)`` valid KV positions per sequence, *including* the
                      ``q_len`` just written.
         page_size:   Tokens per physical block.
+        k_scale:     ``(n_blocks, n_kv, page_size)`` dequantization scales when
+                     the pools hold FP8. Required together with ``v_scale``;
+                     omit both for a bf16/fp32 pool.
+        v_scale:     Same shape as ``k_scale``.
         n_splits:    KV splits. Must be a Python int (constant per CUDA-graph
                      capture); defaults to a heuristic from ``kv_lens.max()``.
         block_n:     KV positions processed per inner iteration.
@@ -252,6 +302,11 @@ def paged_flash_attention(
     assert page == page_size, f"page_size={page_size} != pool page {page}"
     assert n_head % n_kv == 0, f"n_head={n_head} not divisible by n_kv={n_kv}"
     n_rep = n_head // n_kv
+    fp8 = k_scale is not None
+    assert fp8 == (v_scale is not None), "k_scale and v_scale must both be given"
+    if not fp8:
+        # Kernel arguments must still be valid pointers; reuse the pools.
+        k_scale = v_scale = k_pool
 
     rows = n_rep * q_len
     BLOCK_M = max(16, triton.next_power_of_2(rows))
@@ -263,23 +318,30 @@ def paged_flash_attention(
     max_len = block_table.shape[1] * page_size
     split_len = triton.cdiv(triton.cdiv(max_len, n_splits), block_n) * block_n
 
-    acc = torch.empty((B, n_kv, n_splits, BLOCK_M, BLOCK_D), device=q.device, dtype=torch.float32)
-    lse = torch.empty((B, n_kv, n_splits, BLOCK_M), device=q.device, dtype=torch.float32)
+    single = n_splits == 1
+    acc, lse = _scratch(
+        (q.device, B, n_kv, n_splits, BLOCK_M, BLOCK_D),
+        (B, n_kv, n_splits, BLOCK_M, BLOCK_D), (B, n_kv, n_splits, BLOCK_M), q.device,
+    )
     out = torch.empty_like(q)
 
     _paged_flash_decode_kernel[(B, n_kv, n_splits)](
-        q, k_pool, v_pool, block_table, kv_lens,
-        acc, lse,
+        q, k_pool, v_pool, k_scale, v_scale, block_table, kv_lens,
+        out if single else acc, lse,
         D ** -0.5,
         q.stride(0), q.stride(1), q.stride(2),
         k_pool.stride(0), k_pool.stride(1), k_pool.stride(2),
+        k_scale.stride(0), k_scale.stride(1), k_scale.stride(2),
         block_table.stride(0),
         acc.stride(0), acc.stride(1), acc.stride(2), acc.stride(3),
         lse.stride(0), lse.stride(1), lse.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
         q_len, n_rep, split_len, D,
         BLOCK_M=BLOCK_M, BLOCK_N=block_n, BLOCK_D=BLOCK_D, PAGE=page_size,
-        num_warps=4, num_stages=2,
+        SINGLE_SPLIT=single, FP8_KV=fp8, num_warps=4, num_stages=2,
     )
+    if single:
+        return out
     _combine_splits_kernel[(B, n_kv)](
         acc, lse, out,
         acc.stride(0), acc.stride(1), acc.stride(2), acc.stride(3),

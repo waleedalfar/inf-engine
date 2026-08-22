@@ -180,3 +180,86 @@ def test_ragged_batch_lengths():
                             lens[b], q_len, n_head // n_kv)
         torch.testing.assert_close(got[b:b + 1].float(), want_b.float(),
                                    rtol=2e-2, atol=2e-2)
+
+
+# ---------------------------------------------------------------------------
+# FP8 KV storage
+# ---------------------------------------------------------------------------
+
+FP8 = getattr(torch, "float8_e4m3fn", None)
+fp8_only = pytest.mark.skipif(FP8 is None, reason="torch build lacks float8_e4m3fn")
+
+
+def _quantize_fp8(x):
+    """Per-(seq, head, position) scaling, mirroring PagedLlamaKVCache._quantize."""
+    scale = (x.abs().amax(dim=-1).float() / 448.0).clamp(min=1e-12)
+    return (x.float() / scale.unsqueeze(-1)).to(FP8), scale
+
+
+@fp8_only
+@pytest.mark.parametrize("kv_len", [64, 517, 2048])
+def test_fp8_kv_matches_dequantized_reference(kv_len):
+    """FP8 attention must match attending over the dequantized values.
+
+    Compared against the *dequantized* K/V rather than the originals, so this
+    isolates the kernel's scale handling from quantization error itself.
+    """
+    B, n_head, n_kv, q_len, D, page = 1, 8, 2, 5, 64, 16
+    q, kp, vp, bt, kr, vr = _build(B, n_head, n_kv, q_len, kv_len, D, page, seed=kv_len)
+
+    kq, ks = _quantize_fp8(kp)
+    vq, vs = _quantize_fp8(vp)
+    kv_lens = torch.full((B,), kv_len, dtype=torch.int32, device=DEV)
+
+    got = paged_flash_attention(q, kq, vq, bt, kv_lens, page_size=page,
+                                k_scale=ks, v_scale=vs)
+
+    # Reference: the same values the kernel should be reconstructing.
+    kd = (kq.float() * ks.unsqueeze(-1)).to(DTYPE)
+    vd = (vq.float() * vs.unsqueeze(-1)).to(DTYPE)
+    kr_d = torch.empty_like(kr)
+    vr_d = torch.empty_like(vr)
+    for b in range(B):
+        for lb in range(bt.shape[1]):
+            phys = int(bt[b, lb])
+            kr_d[b, :, lb * page:(lb + 1) * page] = kd[phys]
+            vr_d[b, :, lb * page:(lb + 1) * page] = vd[phys]
+    want = _reference(q, kr_d, vr_d, kv_len, q_len, n_head // n_kv)
+
+    assert torch.isfinite(got.float()).all()
+    torch.testing.assert_close(got.float(), want.float(), rtol=3e-2, atol=3e-2)
+
+
+@fp8_only
+def test_fp8_kv_close_to_bf16_kv():
+    """End-to-end quantization error must stay small, not just self-consistent."""
+    B, n_head, n_kv, q_len, kv_len, D, page = 1, 8, 2, 5, 1024, 64, 16
+    q, kp, vp, bt, kr, vr = _build(B, n_head, n_kv, q_len, kv_len, D, page, seed=11)
+    kv_lens = torch.full((B,), kv_len, dtype=torch.int32, device=DEV)
+
+    bf16 = paged_flash_attention(q, kp, vp, bt, kv_lens, page_size=page)
+    kq, ks = _quantize_fp8(kp)
+    vq, vs = _quantize_fp8(vp)
+    fp8 = paged_flash_attention(q, kq, vq, bt, kv_lens, page_size=page,
+                                k_scale=ks, v_scale=vs)
+
+    rel = (fp8.float() - bf16.float()).norm() / bf16.float().norm()
+    assert rel < 0.05, f"FP8 KV diverges from bf16 KV by {rel:.3%}"
+
+
+@fp8_only
+def test_fp8_pool_halves_kv_bytes():
+    """The point of FP8 is bytes read; assert the pool actually shrank."""
+    from engine.config import LlamaConfig
+    from engine.paged_cache import BlockManager, PagedLlamaKVCache
+
+    cfg = LlamaConfig(name="t", vocab_size=32, n_ctx=256, d_model=256, n_layer=2,
+                      n_head=4, n_kv_heads=2, intermediate_size=64)
+    mk = lambda dt: PagedLlamaKVCache(
+        cfg, BlockManager(64, 16), DEV, torch.bfloat16, kv_dtype=dt)
+    bf16_bytes = mk(None).memory_bytes()
+    fp8_bytes = mk(FP8).memory_bytes()
+    assert fp8_bytes * 2 == bf16_bytes, (
+        f"expected FP8 pool to be half of bf16: {fp8_bytes} vs {bf16_bytes}"
+    )
+    assert mk(FP8).fp8 is True and mk(None).fp8 is False

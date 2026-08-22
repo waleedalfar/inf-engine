@@ -193,6 +193,15 @@ class LlamaPagedEngine:
         graph_len_buckets: Candidate KV-gather lengths, must be multiples of
                          block_size (default: power-of-two block multiples
                          up to model.config.n_ctx).
+        kv_dtype:        KV pool storage dtype (default: the model's dtype).
+                         ``torch.float8_e4m3fn`` halves the KV bytes read per
+                         token, which is the dominant cost at long context.
+                         Safe to enable on a speculative *draft* engine at
+                         essentially no quality cost — the draft only proposes
+                         and the target's accept/reject still guarantees the
+                         target's exact output distribution. On a target engine
+                         it changes the model's own distribution, so gate it on
+                         a quality check.
     """
 
     def __init__(
@@ -206,13 +215,15 @@ class LlamaPagedEngine:
         enable_cuda_graphs: bool = False,
         graph_batch_buckets: tuple[int, ...] | None = None,
         graph_len_buckets: list[int] | None = None,
+        kv_dtype: torch.dtype | None = None,
     ) -> None:
         self.model = model
         device = str(model.w.embed_tokens.device)
         dtype = model.w.embed_tokens.dtype
 
         self.manager = BlockManager(n_total_blocks, block_size)
-        self.cache = PagedLlamaKVCache(model.config, self.manager, device, dtype)
+        self.cache = PagedLlamaKVCache(model.config, self.manager, device, dtype,
+                                       kv_dtype=kv_dtype)
         self.cfg = sampling or SamplingConfig()
         self.eos = eos_token
         self.max_queue_depth = max_queue_depth

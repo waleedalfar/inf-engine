@@ -36,6 +36,14 @@ import torch
 from engine.config import LlamaConfig
 from engine.kernels.paged_attention import paged_flash_attention
 
+# FP8 KV storage. e4m3 is the right half for K/V: more mantissa, less range,
+# and per-token scaling supplies the range back.
+_FP8_DTYPES = {
+    getattr(torch, name) for name in ("float8_e4m3fn", "float8_e4m3fnuz")
+    if hasattr(torch, name)
+}
+_FP8_MAX = 448.0        # largest finite magnitude in e4m3
+
 
 class BlockManager:
     """Pool of physical KV-cache blocks shared across all sequences."""
@@ -101,9 +109,20 @@ class PagedLlamaKVCache:
         device: str,
         dtype: torch.dtype,
         owned_layers: range | None = None,
+        kv_dtype: torch.dtype | None = None,
     ) -> None:
         """
         Args:
+            kv_dtype: Storage dtype for the K/V pool. Defaults to ``dtype``.
+                Pass ``torch.float8_e4m3fn`` to halve the pool — and, more to
+                the point, halve the KV traffic that dominates long-context
+                decode. FP8 storage keeps a float32 scale per (block, head,
+                position): 4 bytes against head_dim bytes of payload, ~3%
+                overhead for a 1.94x cut in bytes read per token.
+
+                Only the fused paged-attention path reads FP8 directly; the
+                gather path dequantizes, so it stays correct but gives the
+                bandwidth back.
             owned_layers: Contiguous layer range this cache stores, e.g.
                 ``range(4, 8)`` for a pipeline stage that only owns layers
                 4-7. Defaults to every layer (``range(config.n_layer)``,
@@ -120,8 +139,18 @@ class PagedLlamaKVCache:
         n_total = manager.n_total
         bs = manager.block_size
         shape = (len(self.owned_layers), n_total, config.n_kv_heads, bs, config.head_dim)
-        self.k_pool = torch.zeros(shape, device=device, dtype=dtype)
-        self.v_pool = torch.zeros(shape, device=device, dtype=dtype)
+        self.dtype = dtype
+        self.kv_dtype = kv_dtype or dtype
+        self.fp8 = self.kv_dtype in _FP8_DTYPES
+        self.k_pool = torch.zeros(shape, device=device, dtype=self.kv_dtype)
+        self.v_pool = torch.zeros(shape, device=device, dtype=self.kv_dtype)
+        if self.fp8:
+            # One scale per (block, head, position) — the granularity the kernel
+            # can fold into the score/value math for free.
+            self.k_scale = torch.ones(shape[:-1], device=device, dtype=torch.float32)
+            self.v_scale = torch.ones(shape[:-1], device=device, dtype=torch.float32)
+        else:
+            self.k_scale = self.v_scale = None
         self.block_table: dict[int, list[int]] = {}
         self.seq_lens: dict[int, int] = {}
         self._active: list[int] = []
@@ -401,8 +430,35 @@ class PagedLlamaKVCache:
             block_idx_q = (seq_lens_buf + q) // bs                           # (A,)
             offset_q    = (seq_lens_buf + q) % bs                            # (A,)
             phys_q = block_table_buf.gather(1, block_idx_q.unsqueeze(1)).squeeze(1)  # (A,)
-            self.k_pool[local_layer, phys_q, :, offset_q, :] = k_new[:, :, q, :]
-            self.v_pool[local_layer, phys_q, :, offset_q, :] = v_new[:, :, q, :]
+            kq, vq = k_new[:, :, q, :], v_new[:, :, q, :]                    # (A, n_kv, D)
+            if self.fp8:
+                kq, ks = self._quantize(kq)
+                vq, vs = self._quantize(vq)
+                self.k_scale[local_layer, phys_q, :, offset_q] = ks
+                self.v_scale[local_layer, phys_q, :, offset_q] = vs
+            self.k_pool[local_layer, phys_q, :, offset_q, :] = kq
+            self.v_pool[local_layer, phys_q, :, offset_q, :] = vq
+
+    def _quantize(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-(sequence, head) FP8 quantization of one token's K or V vector.
+
+        Scaling by ``amax / FP8_MAX`` puts the largest magnitude exactly at the
+        format's limit, so nothing saturates and the full mantissa is used.
+        All tensor ops, no data-dependent branching — safe to graph-capture.
+
+        Args:
+            x: (A, n_kv_heads, head_dim)
+
+        Returns:
+            ``(quantized, scale)`` with shapes (A, n_kv_heads, head_dim) and
+            (A, n_kv_heads).
+        """
+        scale = (x.abs().amax(dim=-1).float() / _FP8_MAX).clamp(min=1e-12)
+        return (x.float() / scale.unsqueeze(-1)).to(self.kv_dtype), scale
+
+    def _dequantize(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """Undo ``_quantize`` for the gather path, which reads bf16."""
+        return (x.to(torch.float32) * scale.unsqueeze(-1)).to(self.dtype)
 
     def paged_attend(
         self,
@@ -435,7 +491,10 @@ class PagedLlamaKVCache:
         return paged_flash_attention(
             q, self.k_pool[local_layer], self.v_pool[local_layer],
             block_table_buf, kv_lens,
-            page_size=self.manager.block_size, n_splits=n_splits,
+            page_size=self.manager.block_size,
+            k_scale=self.k_scale[local_layer] if self.fp8 else None,
+            v_scale=self.v_scale[local_layer] if self.fp8 else None,
+            n_splits=n_splits,
         )
 
     def extend_static(
@@ -470,6 +529,12 @@ class PagedLlamaKVCache:
         phys_all = block_table_buf[:, :n_blocks_cap]                      # (A, n_blocks_cap)
         k_gathered = self.k_pool[local_layer, phys_all]      # (A, n_blocks_cap, n_kv_heads, bs, head_dim)
         v_gathered = self.v_pool[local_layer, phys_all]
+        if self.fp8:
+            # This path hands SDPA a dense bf16 tensor, so the FP8 saving is
+            # spent here. It exists for correctness of the fallback only —
+            # fused_attend reads the FP8 pool directly and keeps the bandwidth.
+            k_gathered = self._dequantize(k_gathered, self.k_scale[local_layer, phys_all])
+            v_gathered = self._dequantize(v_gathered, self.v_scale[local_layer, phys_all])
         n_kv_h, head_dim = self.config.n_kv_heads, self.config.head_dim
         k_out = k_gathered.permute(0, 2, 1, 3, 4).reshape(k_new.shape[0], n_kv_h, capture_len, head_dim)
         v_out = v_gathered.permute(0, 2, 1, 3, 4).reshape(k_new.shape[0], n_kv_h, capture_len, head_dim)
