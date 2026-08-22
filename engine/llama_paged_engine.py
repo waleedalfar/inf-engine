@@ -41,6 +41,17 @@ def _default_graph_len_buckets(n_ctx: int, block_size: int) -> list[int]:
     return sorted(set(buckets))
 
 
+def _as_id_row(ids: list[int] | torch.Tensor, device: str) -> torch.Tensor:
+    """Normalise a token-id sequence to a ``(1, T)`` long tensor on ``device``.
+
+    Accepts an already-on-device 1-D tensor (reshaped for free, no host round
+    trip) or a Python list (copied up).
+    """
+    if torch.is_tensor(ids):
+        return ids.view(1, -1).to(device=device, dtype=torch.long)
+    return torch.tensor([ids], dtype=torch.long, device=device)
+
+
 @dataclass
 class _CapturedGraph:
     """One CUDA graph captured for a fixed (batch_bucket, len_bucket) decode shape."""
@@ -494,21 +505,27 @@ class LlamaPagedEngine:
     @torch.no_grad()
     def _step_one_graphed(
         self, seq_id: int, context_ids: torch.Tensor | None = None,
-    ) -> tuple[int, torch.Tensor]:
-        """Single-sequence q_len=1 decode; returns (token_id, raw_logits_row).
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single-sequence q_len=1 decode; returns ``(token_id_1d, logits_row)``.
+
+        The token is returned as a ``(1,)`` device tensor rather than a Python
+        int so that a caller running K draft steps back to back pays **zero**
+        GPU→CPU syncs inside the loop and can batch them into one ``.tolist()``.
 
         Uses a captured CUDA graph when ``enable_cuda_graphs`` is True,
         otherwise falls back to eager. ``context_ids`` (1-D tensor of all
         generated token ids so far) is forwarded to repetition penalty sampling.
-        Caller must call ``cache.ensure_slot(seq_id)`` before each invocation.
+        Caller must ensure ``cache`` has a free slot before each invocation.
         """
         if not self.enable_cuda_graphs:
-            return self._step_one_eager(seq_id, context_ids)
+            _, logits_row = self._step_one_eager(seq_id, context_ids)
+            return self._active[seq_id][1], logits_row
 
         seq_len = self.cache.seq_lens[seq_id]
         bucket = self._pick_bucket(1, seq_len + 1)
         if bucket is None:
-            return self._step_one_eager(seq_id, context_ids)
+            _, logits_row = self._step_one_eager(seq_id, context_ids)
+            return self._active[seq_id][1], logits_row
         batch_bucket, len_bucket = bucket
 
         cg = self._graphs.get(bucket)
@@ -519,14 +536,18 @@ class LlamaPagedEngine:
         self._fill_graph_inputs(cg, [seq_id])
         cg.graph.replay()
 
-        logits_row = cg.logits[0, -1, :]                                # (vocab,)
+        # cg.logits aliases the graph's *static* output buffer, which the next
+        # replay overwrites in place.  Speculative decode holds all K draft
+        # rows until after the draft loop finishes, so clone out of the buffer
+        # — without this every row would read back as the last replay's logits.
+        logits_row = cg.logits[0, -1, :].clone()                        # (vocab,)
         ctx_2d = context_ids.unsqueeze(0) if context_ids is not None else None
-        tok = int(sample_next_token(logits_row.unsqueeze(0), self.cfg, ctx_2d).item())
+        tok_t = sample_next_token(logits_row.unsqueeze(0), self.cfg, ctx_2d).view(1)
 
         self.cache.seq_lens[seq_id] += 1                                 # extend_static doesn't update this
         req = self._active[seq_id][0]
-        self._active[seq_id] = (req, torch.tensor([tok], device=self.device))
-        return tok, logits_row
+        self._active[seq_id] = (req, tok_t)
+        return tok_t, logits_row
 
     @torch.no_grad()
     def _step_one_eager(
@@ -553,18 +574,24 @@ class LlamaPagedEngine:
         return tok, logits_row
 
     @torch.no_grad()
-    def _step_verify_eager(self, seq_id: int, verify_ids: list[int]) -> torch.Tensor:
+    def _step_verify_eager(
+        self, seq_id: int, verify_ids: list[int] | torch.Tensor
+    ) -> torch.Tensor:
         """Eager multi-token forward for the target verify step.
 
         Writes K+1 KV entries into the cache and returns raw ``(K+1, vocab)``
         logits. Does NOT sample — the caller (SpeculativePagedEngine) runs
         accept/reject on the returned logits.
+
+        ``verify_ids`` may be a Python list or a 1-D device tensor; the tensor
+        form lets speculative decode feed draft tokens straight back in without
+        a GPU→CPU→GPU round trip.
         """
         K1 = len(verify_ids)
         L = self.cache.seq_lens[seq_id]
         self.cache.ensure_slots_for(seq_id, K1)
         self.cache.begin_step([seq_id])
-        ids = torch.tensor([verify_ids], device=self.device)            # (1, K+1)
+        ids = _as_id_row(verify_ids, self.device)                       # (1, K+1)
         pos_ids = torch.arange(L, L + K1, device=self.device).unsqueeze(0)  # (1, K+1)
         T_total = L + K1
         ar = torch.arange(T_total, device=self.device)
@@ -616,7 +643,9 @@ class LlamaPagedEngine:
         )
 
     @torch.no_grad()
-    def _step_verify_graphed(self, seq_id: int, verify_ids: list[int]) -> torch.Tensor:
+    def _step_verify_graphed(
+        self, seq_id: int, verify_ids: list[int] | torch.Tensor
+    ) -> torch.Tensor:
         """Graphed verify step; falls back to eager when CUDA graphs are off or bucket too large."""
         if not self.enable_cuda_graphs:
             return self._step_verify_eager(seq_id, verify_ids)
@@ -639,7 +668,7 @@ class LlamaPagedEngine:
         )
         vg.block_table_buf.copy_(block_table_buf)
         vg.seq_lens_buf.copy_(seq_lens_buf)
-        vg.input_ids.copy_(torch.tensor([verify_ids], dtype=torch.long, device=self.device))
+        vg.input_ids.copy_(_as_id_row(verify_ids, self.device))
         vg.position_ids.copy_(torch.arange(L, L + q_len, device=self.device).unsqueeze(0))
         ar    = torch.arange(len_bucket, device=self.device)
         q_abs = vg.position_ids[0]

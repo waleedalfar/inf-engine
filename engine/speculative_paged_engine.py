@@ -30,7 +30,8 @@ from dataclasses import dataclass, field
 import torch
 
 from engine.llama_paged_engine import LlamaPagedEngine, LlamaRequest
-from engine.speculative import SpecStats, _correction_sample, _get_probs, _sample_from_probs
+from engine.sampling import SamplingConfig, SamplingMode, _apply_repetition_penalty
+from engine.speculative import SpecStats, _correction_sample, _sample_from_probs
 
 
 @dataclass
@@ -126,103 +127,119 @@ class SpeculativePagedEngine:
 
         stats = SpecStats()
 
+        # Repetition-penalty context. Only materialised when a penalty is
+        # actually configured — otherwise _get_probs ignores it and rebuilding
+        # a growing device tensor every step is pure waste.
+        ctx = (
+            _RollingCtx(req.generated, req.max_new_tokens + self.n_draft + 2,
+                        target.device, draft.device)
+            if target.cfg.repetition_penalty != 1.0 or draft.cfg.repetition_penalty != 1.0
+            else None
+        )
+
         # ── Speculative decode loop ─────────────────────────────────────
         while True:
             remaining = req.max_new_tokens - len(req.generated)
             if remaining <= 0:
                 break
 
+            t_ctx = ctx.target if ctx is not None else None
+            d_ctx = ctx.draft if ctx is not None else None
+
             K = min(self.n_draft, remaining - 1)
             if K <= 0:
                 # Only one token left — run a single target step and stop.
                 target.cache.ensure_slot(t_sid)
-                context_ids = _make_ctx(req.generated, target.device)
-                tok, _ = target._step_one_eager(t_sid, context_ids)
+                tok, _ = target._step_one_eager(t_sid, t_ctx)
                 req.generated.append(tok)
                 break
 
             # current length in both caches (must be aligned)
             L = target.cache.seq_lens[t_sid]
 
-            # context for repetition penalty (accepted generated tokens only)
-            context_ids = _make_ctx(req.generated, target.device)
-            draft_ctx = _make_ctx(req.generated, draft.device)
-
             # ── Draft phase ──────────────────────────────────────────────
-            draft_tokens: list[int] = []
+            # One batched allocation covers all K positions, and tokens stay on
+            # the GPU as (1,) tensors — no sync anywhere in this loop.
+            draft.cache.ensure_slots_for(d_sid, K)
+            tok_tensors: list[torch.Tensor] = []
             draft_logits: list[torch.Tensor] = []
-            for k in range(K):
-                tok, logits = draft._step_one_graphed(d_sid, draft_ctx)
-                draft_tokens.append(tok)
+            for _ in range(K):
+                tok_t, logits = draft._step_one_graphed(d_sid, d_ctx)
+                tok_tensors.append(tok_t)
                 draft_logits.append(logits)
-                if k < K - 1:
-                    draft.cache.ensure_slot(d_sid)
 
             # ── Verify phase ─────────────────────────────────────────────
-            last_target_tok = int(target._active[t_sid][1].item())
-            verify_ids = [last_target_tok] + draft_tokens       # K+1 tokens
-            t_logits = target._step_verify_graphed(t_sid, verify_ids)  # (K+1, vocab)
+            draft_ids = torch.cat(tok_tensors).to(target.device)          # (K,)
+            verify_ids = torch.cat([target._active[t_sid][1], draft_ids])  # (K+1,)
+            t_logits = target._step_verify_graphed(t_sid, verify_ids)      # (K+1, vocab)
 
-            # ── Accept / reject ──────────────────────────────────────────
-            emitted: list[int] = []
-            all_accepted = True
+            # ── Accept / reject, batched on the GPU ──────────────────────
+            p_t_all = _get_probs_batch(t_logits, target.cfg, t_ctx)        # (K+1, V)
+            p_d = _get_probs_batch(torch.stack(draft_logits), draft.cfg, d_ctx)
+            p_d = p_d.to(p_t_all.device)                                   # (K, V)
 
-            for j in range(K):
-                tok_id = draft_tokens[j]
-                p_t = _get_probs(t_logits[j], target.cfg, context_ids)
-                p_d = _get_probs(draft_logits[j], draft.cfg, draft_ctx)
-                accept_prob = min(1.0, (p_t[tok_id] / (p_d[tok_id] + 1e-10)).item())
+            rows = torch.arange(K, device=p_t_all.device)
+            accept_prob = (
+                p_t_all[rows, draft_ids] / (p_d[rows, draft_ids] + 1e-10)
+            ).clamp(max=1.0)                                               # (K,)
+            # torch.rand must be built on the generator's own device; .to()
+            # then matches accept_prob's device and dtype for the comparison.
+            gen = target.cfg.generator
+            u = torch.rand(
+                K, generator=gen, device=gen.device if gen is not None else "cpu"
+            ).to(accept_prob)
+            rejected = u >= accept_prob                                    # (K,)
+            # Leading run of accepts: positions before the first rejection are
+            # exactly those whose running rejection count is still zero.
+            n_acc_t = (rejected.cumsum(0) == 0).sum()
 
-                u = torch.rand(1, generator=target.cfg.generator).item()
-                if u < accept_prob:
-                    emitted.append(tok_id)
-                    stats.n_accepted += 1
-                else:
-                    corr = int(_correction_sample(p_t, p_d, target.cfg).item())
-                    emitted.append(corr)
-                    stats.n_rejected += 1
+            # Both continuations are computed unconditionally so the branch can
+            # be decided after the single sync below. Each is one vocab-sized
+            # op — negligible next to the target forward we just ran.
+            j = n_acc_t.clamp(max=K - 1)
+            corr_t = _correction_sample(p_t_all[j], p_d[j], target.cfg).view(1)
+            bonus_t = _sample_from_probs(p_t_all[K], target.cfg).view(1)
 
-                    # Rollback both caches to L+j+1 (KVs for positions 0..L+j kept).
-                    # position L is last_target_tok (first verify input), written at pos L.
-                    # positions L+1..L+j are accepted draft tokens.
-                    # position L+j+1 is where the correction goes next.
-                    target.cache.reset_to(t_sid, L + j + 1)
-                    draft.cache.reset_to(d_sid, L + j + 1)
+            # ── The one GPU→CPU sync per speculative step ────────────────
+            packed = torch.cat([n_acc_t.view(1), draft_ids, corr_t, bonus_t]).tolist()
+            n_accepted, draft_tokens = packed[0], packed[1 : 1 + K]
+            corr, bonus = packed[1 + K], packed[2 + K]
 
-                    corr_t = torch.tensor([corr], device=target.device)
-                    target._active[t_sid] = (req, corr_t)
-                    draft._active[d_sid] = (draft_req, corr_t.to(draft.device))
+            if n_accepted < K:
+                emitted = draft_tokens[:n_accepted] + [corr]
+                stats.n_accepted += n_accepted
+                stats.n_rejected += 1
 
-                    target.cache.ensure_slot(t_sid)
-                    draft.cache.ensure_slot(d_sid)
-                    all_accepted = False
-                    break
-
-            if all_accepted:
-                # Sample bonus token from target position K.
-                p_bonus = _get_probs(t_logits[K], target.cfg, context_ids)
-                bonus = int(_sample_from_probs(p_bonus, target.cfg).item())
-                emitted.append(bonus)
+                # Rollback both caches to L+n+1 (KVs for positions 0..L+n kept).
+                # position L holds the last target token (first verify input);
+                # positions L+1..L+n are the accepted draft tokens;
+                # position L+n+1 is where the correction goes next.
+                target.cache.reset_to(t_sid, L + n_accepted + 1)
+                draft.cache.reset_to(d_sid, L + n_accepted + 1)
+                nxt_t = corr_t
+            else:
+                emitted = draft_tokens + [bonus]
+                stats.n_accepted += K
                 stats.n_bonus += 1
 
                 # Sync draft: advance it from L+K to L+K+1 so it's aligned with target.
                 draft.cache.ensure_slot(d_sid)
-                draft._step_one_graphed(d_sid, draft_ctx)               # output discarded
+                draft._step_one_graphed(d_sid, d_ctx)               # output discarded
+                nxt_t = bonus_t
 
-                # Both caches are now at L+K+1; point _active at bonus token.
-                bonus_t = torch.tensor([bonus], device=target.device)
-                target._active[t_sid] = (req, bonus_t)
-                draft._active[d_sid] = (draft_req, bonus_t.to(draft.device))
-
-                target.cache.ensure_slot(t_sid)
-                draft.cache.ensure_slot(d_sid)
+            target._active[t_sid] = (req, nxt_t)
+            draft._active[d_sid] = (draft_req, nxt_t.to(draft.device))
+            target.cache.ensure_slot(t_sid)
+            draft.cache.ensure_slot(d_sid)
 
             stats.n_steps += 1
 
             # ── Emit tokens, check stopping conditions ───────────────────
             done = False
+            appended: list[int] = []
             for tok in emitted:
                 req.generated.append(tok)
+                appended.append(tok)
                 if (
                     len(req.generated) >= req.max_new_tokens
                     or tok == self.eos
@@ -230,6 +247,8 @@ class SpeculativePagedEngine:
                 ):
                     done = True
                     break
+            if ctx is not None:
+                ctx.extend(appended)
             if done:
                 break
 
@@ -255,8 +274,85 @@ class SpeculativePagedEngine:
 # Utilities
 # ---------------------------------------------------------------------------
 
-def _make_ctx(generated: list[int], device: str) -> torch.Tensor | None:
-    """Build a 1-D context tensor for repetition penalty, or None if empty."""
-    if not generated:
-        return None
-    return torch.tensor(generated, device=device)
+def _get_probs_batch(
+    logits: torch.Tensor,
+    cfg: SamplingConfig,
+    context_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Row-wise ``_get_probs`` over a stack of positions.
+
+    Each output row is what ``_get_probs`` would return for that row on its
+    own; doing all N at once keeps the accept/reject decision on the GPU
+    instead of one softmax-plus-``.item()`` per draft token.
+
+    Args:
+        logits:      (N, vocab_size) raw logits.
+        cfg:         Sampling configuration.
+        context_ids: 1-D ids seen so far, shared by every row. Used for
+                     repetition penalty when ``cfg.repetition_penalty != 1.0``.
+
+    Returns:
+        (N, vocab_size) probability distributions, each row summing to 1.
+    """
+    if cfg.repetition_penalty != 1.0 and context_ids is not None:
+        logits = _apply_repetition_penalty(logits, context_ids, cfg.repetition_penalty)
+
+    if cfg.mode is SamplingMode.GREEDY:
+        # One-hot at argmax — avoids float noise in the correction formula.
+        probs = torch.zeros_like(logits)
+        probs.scatter_(1, logits.argmax(dim=-1, keepdim=True), 1.0)
+        return probs
+
+    scaled = logits / max(cfg.temperature, 1e-8)
+
+    if cfg.mode is SamplingMode.TOP_K:
+        k = max(1, min(cfg.top_k, logits.shape[-1]))
+        kth = torch.topk(scaled, k, dim=-1).values[:, -1:]
+        scaled = scaled.masked_fill(scaled < kth, float("-inf"))
+    elif cfg.mode is SamplingMode.TOP_P:
+        sorted_logits, sorted_idx = torch.sort(scaled, dim=-1, descending=True)
+        sorted_probs = torch.softmax(sorted_logits, dim=-1)
+        drop = (sorted_probs.cumsum(dim=-1) - sorted_probs) >= cfg.top_p
+        drop[:, 0] = False
+        mask = torch.zeros_like(scaled, dtype=torch.bool).scatter(1, sorted_idx, drop)
+        scaled = scaled.masked_fill(mask, float("-inf"))
+
+    return torch.softmax(scaled, dim=-1)
+
+
+class _RollingCtx:
+    """Growing repetition-penalty token buffer, mirrored on target and draft.
+
+    Rebuilding ``torch.tensor(req.generated)`` once per speculative step costs
+    a host→device copy that grows with the generation length. This preallocates
+    one buffer per device and appends only the tokens emitted this step.
+    """
+
+    def __init__(
+        self, generated: list[int], capacity: int, t_device: str, d_device: str
+    ) -> None:
+        self._t = torch.zeros(capacity, dtype=torch.long, device=t_device)
+        self._d = (
+            self._t if str(d_device) == str(t_device)
+            else torch.zeros(capacity, dtype=torch.long, device=d_device)
+        )
+        self._n = 0
+        self.extend(generated)
+
+    def extend(self, tokens: list[int]) -> None:
+        if not tokens:
+            return
+        src = torch.tensor(tokens, dtype=torch.long)
+        end = self._n + len(tokens)
+        self._t[self._n : end].copy_(src)
+        if self._d is not self._t:
+            self._d[self._n : end].copy_(src)
+        self._n = end
+
+    @property
+    def target(self) -> torch.Tensor | None:
+        return self._t[: self._n] if self._n else None
+
+    @property
+    def draft(self) -> torch.Tensor | None:
+        return self._d[: self._n] if self._n else None

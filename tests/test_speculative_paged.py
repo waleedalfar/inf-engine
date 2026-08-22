@@ -19,7 +19,12 @@ import torch
 from engine.config import LlamaConfig
 from engine.llama_paged_engine import LlamaPagedEngine, LlamaRequest
 from engine.sampling import SamplingConfig, SamplingMode
-from engine.speculative_paged_engine import SpeculativePagedEngine
+from engine.speculative import _get_probs
+from engine.speculative_paged_engine import (
+    SpeculativePagedEngine,
+    _get_probs_batch,
+    _RollingCtx,
+)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float32
@@ -363,3 +368,81 @@ def test_multiple_requests():
         assert len(tokens) == 5, f"req {req_id}: expected 5 tokens, got {len(tokens)}"
 
     assert stats.n_steps > 0
+
+
+# ---------------------------------------------------------------------------
+# Batched accept/reject helpers (Phase 4 — sync elimination)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("mode", list(SamplingMode))
+@pytest.mark.parametrize("rep_penalty", [1.0, 1.15])
+def test_get_probs_batch_matches_row_wise(mode, rep_penalty):
+    """_get_probs_batch must be row-for-row identical to _get_probs.
+
+    The GPU-batched accept/reject path replaces K separate _get_probs calls
+    with one batched call; any divergence here silently changes which draft
+    tokens get accepted.
+    """
+    torch.manual_seed(7)
+    logits = torch.randn(5, 64, device=DEVICE, dtype=DTYPE)
+    context = torch.randint(0, 64, (23,), device=DEVICE)
+    cfg = SamplingConfig(mode=mode, temperature=0.8, top_k=8, top_p=0.9,
+                         repetition_penalty=rep_penalty)
+
+    batched = _get_probs_batch(logits, cfg, context)
+    for i in range(logits.shape[0]):
+        expected = _get_probs(logits[i], cfg, context)
+        torch.testing.assert_close(batched[i], expected, rtol=1e-5, atol=1e-6)
+
+
+def test_get_probs_batch_ignores_context_without_penalty():
+    """With penalty 1.0 the context is unused, so passing None must be identical."""
+    torch.manual_seed(8)
+    logits = torch.randn(3, 64, device=DEVICE, dtype=DTYPE)
+    cfg = SamplingConfig(mode=SamplingMode.TOP_P, top_p=0.9, repetition_penalty=1.0)
+    context = torch.randint(0, 64, (11,), device=DEVICE)
+
+    torch.testing.assert_close(
+        _get_probs_batch(logits, cfg, context), _get_probs_batch(logits, cfg, None)
+    )
+
+
+def test_rolling_ctx_tracks_generated_tokens():
+    """_RollingCtx must expose exactly what torch.tensor(req.generated) would."""
+    ctx = _RollingCtx([5, 9], capacity=16, t_device=DEVICE, d_device=DEVICE)
+    generated = [5, 9]
+    for chunk in ([1, 2, 3], [], [4]):
+        ctx.extend(chunk)
+        generated += chunk
+        expected = torch.tensor(generated, device=DEVICE)
+        torch.testing.assert_close(ctx.target, expected)
+        torch.testing.assert_close(ctx.draft, expected)
+
+
+def test_rolling_ctx_empty_is_none():
+    ctx = _RollingCtx([], capacity=8, t_device=DEVICE, d_device=DEVICE)
+    assert ctx.target is None and ctx.draft is None
+
+
+def test_sampling_spec_respects_repetition_penalty_context():
+    """End-to-end run with a repetition penalty exercises the _RollingCtx path."""
+    cfg = _mini_config()
+    torch.manual_seed(11)
+    sampling = SamplingConfig(mode=SamplingMode.TOP_K, top_k=8, temperature=0.9,
+                              repetition_penalty=1.2,
+                              generator=torch.Generator(device=DEVICE).manual_seed(11))
+    t_engine = LlamaPagedEngine(_mini_model(cfg, seed=1), n_total_blocks=200,
+                                block_size=16, eos_token=None, sampling=sampling)
+    d_engine = LlamaPagedEngine(_mini_model(cfg, seed=2), n_total_blocks=200,
+                                block_size=16, eos_token=None, sampling=sampling)
+    spec = SpeculativePagedEngine(t_engine, d_engine, n_draft=3)
+
+    req = LlamaRequest(req_id=0, prompt_ids=[1, 2, 3], max_new_tokens=20)
+    generated, stats = spec._generate_one(req)
+
+    assert len(generated) == 20
+    assert all(0 <= t < cfg.vocab_size for t in generated)
+    # Every spec step emits at least one token, and the prefill token plus the
+    # final K<=0 target step are not counted in stats.
+    emitted = stats.n_accepted + stats.n_rejected + stats.n_bonus
+    assert stats.n_steps <= emitted <= len(generated)
