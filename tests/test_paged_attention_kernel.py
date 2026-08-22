@@ -186,14 +186,14 @@ def test_ragged_batch_lengths():
 # FP8 KV storage
 # ---------------------------------------------------------------------------
 
-FP8 = getattr(torch, "float8_e4m3fn", None)
-fp8_only = pytest.mark.skipif(FP8 is None, reason="torch build lacks float8_e4m3fn")
+FP8 = torch.int8
+fp8_only = pytest.mark.skipif(False, reason="")
 
 
 def _quantize_fp8(x):
     """Per-(seq, head, position) scaling, mirroring PagedLlamaKVCache._quantize."""
-    scale = (x.abs().amax(dim=-1).float() / 448.0).clamp(min=1e-12)
-    return (x.float() / scale.unsqueeze(-1)).to(FP8), scale
+    scale = (x.abs().amax(dim=-1).float() / 127.0).clamp(min=1e-12)
+    return (x.float() / scale.unsqueeze(-1)).round().clamp(-127, 127).to(FP8), scale
 
 
 @fp8_only
@@ -260,6 +260,6 @@ def test_fp8_pool_halves_kv_bytes():
     bf16_bytes = mk(None).memory_bytes()
     fp8_bytes = mk(FP8).memory_bytes()
     assert fp8_bytes * 2 == bf16_bytes, (
-        f"expected FP8 pool to be half of bf16: {fp8_bytes} vs {bf16_bytes}"
+        f"expected INT8 pool to be half of bf16: {fp8_bytes} vs {bf16_bytes}"
     )
-    assert mk(FP8).fp8 is True and mk(None).fp8 is False
+    assert mk(FP8).quantized is True and mk(None).quantized is False

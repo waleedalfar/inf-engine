@@ -75,7 +75,7 @@ def _paged_flash_decode_kernel(
     BLOCK_D: tl.constexpr,
     PAGE: tl.constexpr,
     SINGLE_SPLIT: tl.constexpr,
-    FP8_KV: tl.constexpr,
+    QUANT_KV: tl.constexpr,
 ):
     """One program = (batch, kv_head, kv_split). Emits a normalized partial + lse."""
     b = tl.program_id(0)
@@ -127,7 +127,7 @@ def _paged_flash_decode_kernel(
         k = tl.load(KPool + kv_off, mask=kv_mask, other=0.0)
         v = tl.load(VPool + kv_off, mask=kv_mask, other=0.0)
 
-        if FP8_KV:
+        if QUANT_KV:
             # Per-(position, head) scales, so dequantization folds into work we
             # already do: K's scale is a per-key column factor on the scores,
             # and V's is a per-row factor applied before the second dot. Neither
@@ -135,9 +135,13 @@ def _paged_flash_decode_kernel(
             s_off = (blk * stride_ks_blk + h_kv * stride_ks_h + off * stride_ks_pos)
             ks = tl.load(KScale + s_off, mask=in_range, other=0.0)
             vs = tl.load(VScale + s_off, mask=in_range, other=0.0)
-            k = k.to(tl.float32)
+            # Widen to the query dtype, not fp32: an 8-bit code fits bf16
+            # exactly, and the dot stays on bf16 tensor cores. Going through
+            # fp32 with allow_tf32=False drops off tensor cores entirely and
+            # measured slower than not quantizing at all.
+            k = k.to(q.dtype)
             v = (v.to(tl.float32) * vs[:, None]).to(q.dtype)
-            qk = tl.dot(q.to(tl.float32), tl.trans(k), allow_tf32=False)
+            qk = tl.dot(q, tl.trans(k), allow_tf32=False).to(tl.float32)
             qk = qk * ks[None, :] * scale
         else:
             qk = tl.dot(q, tl.trans(k), allow_tf32=False).to(tl.float32) * scale                      # (BLOCK_M, BLOCK_N)
@@ -286,8 +290,8 @@ def paged_flash_attention(
                      ``q_len`` just written.
         page_size:   Tokens per physical block.
         k_scale:     ``(n_blocks, n_kv, page_size)`` dequantization scales when
-                     the pools hold FP8. Required together with ``v_scale``;
-                     omit both for a bf16/fp32 pool.
+                     the pools hold 8-bit codes (INT8 or FP8). Required together
+                     with ``v_scale``; omit both for a bf16/fp32 pool.
         v_scale:     Same shape as ``k_scale``.
         n_splits:    KV splits. Must be a Python int (constant per CUDA-graph
                      capture); defaults to a heuristic from ``kv_lens.max()``.
@@ -302,9 +306,9 @@ def paged_flash_attention(
     assert page == page_size, f"page_size={page_size} != pool page {page}"
     assert n_head % n_kv == 0, f"n_head={n_head} not divisible by n_kv={n_kv}"
     n_rep = n_head // n_kv
-    fp8 = k_scale is not None
-    assert fp8 == (v_scale is not None), "k_scale and v_scale must both be given"
-    if not fp8:
+    quant = k_scale is not None
+    assert quant == (v_scale is not None), "k_scale and v_scale must both be given"
+    if not quant:
         # Kernel arguments must still be valid pointers; reuse the pools.
         k_scale = v_scale = k_pool
 
@@ -338,7 +342,7 @@ def paged_flash_attention(
         out.stride(0), out.stride(1), out.stride(2),
         q_len, n_rep, split_len, D,
         BLOCK_M=BLOCK_M, BLOCK_N=block_n, BLOCK_D=BLOCK_D, PAGE=page_size,
-        SINGLE_SPLIT=single, FP8_KV=fp8, num_warps=4, num_stages=2,
+        SINGLE_SPLIT=single, QUANT_KV=quant, num_warps=4, num_stages=2,
     )
     if single:
         return out
@@ -353,3 +357,104 @@ def paged_flash_attention(
         num_warps=4,
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Fused quantized KV write
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _write_kv_quant_kernel(
+    KNew, VNew, KPool, VPool, KScale, VScale, BlockTable, SeqLens,
+    stride_kb, stride_kh, stride_kt,
+    stride_vb, stride_vh, stride_vt,
+    stride_pb, stride_ph, stride_pp,
+    stride_sb, stride_sh, stride_sp,
+    stride_bt_b,
+    head_dim,
+    PAGE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    QMAX: tl.constexpr,
+    IS_INT: tl.constexpr,
+):
+    """One program per (sequence, kv_head, new token): quantize and scatter.
+
+    Doing this with torch ops costs ~10 kernels per layer (two amax reductions,
+    two divides, two casts, and four scatters) and measured *slower* than the
+    bf16 path it was meant to beat — the write overhead swamped the read saving.
+    Here the whole thing is one launch and the scale never leaves registers
+    until its single store.
+    """
+    a = tl.program_id(0)
+    h = tl.program_id(1)
+    t = tl.program_id(2)
+
+    pos = tl.load(SeqLens + a) + t
+    blk = tl.load(BlockTable + a * stride_bt_b + pos // PAGE)
+    off = pos % PAGE
+
+    d = tl.arange(0, BLOCK_D)
+    dm = d < head_dim
+    # K and V are separate tensors with independently derived layouts — K goes
+    # through QK-norm and RoPE, V does not — so they do NOT share strides.
+    # Reusing K's for both silently corrupts V at every token past the first.
+    k_src = a * stride_kb + h * stride_kh + t * stride_kt + d
+    v_src = a * stride_vb + h * stride_vh + t * stride_vt + d
+    dst = blk * stride_pb + h * stride_ph + off * stride_pp + d
+    s_at = blk * stride_sb + h * stride_sh + off * stride_sp
+
+    k = tl.load(KNew + k_src, mask=dm, other=0.0).to(tl.float32)
+    v = tl.load(VNew + v_src, mask=dm, other=0.0).to(tl.float32)
+    # amax/QMAX puts the largest magnitude exactly at the format's limit, so
+    # nothing saturates and the full code range is in use.
+    ks = tl.maximum(tl.max(tl.abs(k), axis=0) / QMAX, 1e-12)
+    vs = tl.maximum(tl.max(tl.abs(v), axis=0) / QMAX, 1e-12)
+    kq = k / ks
+    vq = v / vs
+    if IS_INT:
+        # Triton's float->int cast truncates; round half away from zero, then
+        # clamp so a boundary case cannot wrap.
+        kq = tl.where(kq >= 0, tl.floor(kq + 0.5), tl.ceil(kq - 0.5))
+        vq = tl.where(vq >= 0, tl.floor(vq + 0.5), tl.ceil(vq - 0.5))
+        kq = tl.minimum(tl.maximum(kq, -QMAX), QMAX)
+        vq = tl.minimum(tl.maximum(vq, -QMAX), QMAX)
+
+    tl.store(KPool + dst, kq.to(KPool.dtype.element_ty), mask=dm)
+    tl.store(VPool + dst, vq.to(VPool.dtype.element_ty), mask=dm)
+    tl.store(KScale + s_at, ks)
+    tl.store(VScale + s_at, vs)
+
+
+def write_kv_quant(
+    k_new: torch.Tensor, v_new: torch.Tensor,
+    k_pool: torch.Tensor, v_pool: torch.Tensor,
+    k_scale: torch.Tensor, v_scale: torch.Tensor,
+    block_table: torch.Tensor, seq_lens: torch.Tensor,
+    *, page_size: int, qmax: float, is_int: bool,
+) -> None:
+    """Quantize ``k_new``/``v_new`` to 8-bit and scatter them into the pool.
+
+    Args:
+        k_new, v_new: (A, n_kv, q_len, head_dim) in the model dtype.
+        k_pool, v_pool: (n_blocks, n_kv, page_size, head_dim) INT8/FP8, one layer.
+        k_scale, v_scale: (n_blocks, n_kv, page_size) float32, for one layer.
+        block_table: (A, n_blocks_cap) physical block ids.
+        seq_lens: (A,) token count *before* this write.
+        page_size: Tokens per physical block.
+        qmax: Largest representable magnitude of the storage format.
+        is_int: Round-to-nearest before storing (integer formats only).
+    """
+    A, n_kv, q_len, D = k_new.shape
+    assert k_new.stride(3) == 1 and v_new.stride(3) == 1, \
+        "write_kv_quant requires head_dim to be the contiguous axis"
+    _write_kv_quant_kernel[(A, n_kv, q_len)](
+        k_new, v_new, k_pool, v_pool, k_scale, v_scale, block_table, seq_lens,
+        k_new.stride(0), k_new.stride(1), k_new.stride(2),
+        v_new.stride(0), v_new.stride(1), v_new.stride(2),
+        k_pool.stride(0), k_pool.stride(1), k_pool.stride(2),
+        k_scale.stride(0), k_scale.stride(1), k_scale.stride(2),
+        block_table.stride(0),
+        D,
+        PAGE=page_size, BLOCK_D=max(16, triton.next_power_of_2(D)),
+        QMAX=qmax, IS_INT=is_int, num_warps=4,
+    )
