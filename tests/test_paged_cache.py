@@ -322,3 +322,47 @@ def test_paged_engine_eos_stops_early():
     results = engine.run_offline([req])
     assert len(results[0]) == 1
     assert results[0][0] == first_predicted
+
+
+# ---------------------------------------------------------------------------
+# build_static_buffers write-safety guard
+# ---------------------------------------------------------------------------
+
+def _tiny_cache(n_blocks=8, block_size=16):
+    from engine.config import LlamaConfig
+    from engine.paged_cache import BlockManager, PagedLlamaKVCache
+    cfg = LlamaConfig(name="t", vocab_size=32, n_ctx=128, d_model=16, n_layer=1,
+                      n_head=2, n_kv_heads=1, intermediate_size=32)
+    mgr = BlockManager(n_total=n_blocks, block_size=block_size)
+    return PagedLlamaKVCache(cfg, mgr, device="cpu", dtype=torch.float32)
+
+
+def test_build_static_buffers_rejects_unallocated_writes():
+    """Writing through padded columns would alias the sequence's own block 0.
+
+    Column padding repeats block 0, which is fine for reads (attn_mask hides
+    those positions) but silently corrupts positions 0..block_size-1 if a
+    forward writes through it. Callers that write pass write_len so the
+    missing allocation is caught instead of corrupting the cache.
+    """
+    cache = _tiny_cache()
+    cache.allocate_sequence(0, prompt_len=16)   # exactly one block
+    cache.seq_lens[0] = 16                       # block full, none spare
+
+    # Read-only use is still allowed to pad.
+    cache.build_static_buffers([0], 1, 64, "cpu")
+
+    with pytest.raises(ValueError, match="ensure_slots_for"):
+        cache.build_static_buffers([0], 1, 64, "cpu", write_len=5)
+
+
+def test_build_static_buffers_allows_writes_once_allocated():
+    cache = _tiny_cache()
+    cache.allocate_sequence(0, prompt_len=16)
+    cache.seq_lens[0] = 16
+    cache.ensure_slots_for(0, 5)
+    bt, lens = cache.build_static_buffers([0], 1, 64, "cpu", write_len=5)
+    assert bt.shape == (1, 4) and int(lens[0]) == 16
+    # The columns covering the written positions must be distinct real blocks,
+    # not padding aliased onto block 0.
+    assert bt[0, 0].item() != bt[0, 1].item()

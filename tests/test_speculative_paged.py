@@ -446,3 +446,59 @@ def test_sampling_spec_respects_repetition_penalty_context():
     # final K<=0 target step are not counted in stats.
     emitted = stats.n_accepted + stats.n_rejected + stats.n_bonus
     assert stats.n_steps <= emitted <= len(generated)
+
+
+# ---------------------------------------------------------------------------
+# Verify-graph capture must not corrupt the KV cache (regression)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs require CUDA")
+@pytest.mark.parametrize("n_draft", [2, 4])
+def test_greedy_spec_matches_standard_across_bucket_boundaries(n_draft):
+    """Long enough to capture new verify graphs mid-generation.
+
+    Regression test. ``_step_verify_graphed`` used to capture its CUDA graph
+    *before* calling ``ensure_slots_for``. Capture runs warmup forwards that
+    write KV, and ``build_static_buffers`` pads unallocated block-table columns
+    with the sequence's own block 0 — so those writes landed on the sequence's
+    positions 0..block_size-1 and destroyed its prompt. The corruption only
+    happened on the step that first needed a new (len_bucket, q_len) pair, so
+    every existing test missed it: they generate at most 15 tokens with
+    block_size=16 and never cross a boundary.
+
+    With block_size=16 and n_ctx=128 the len buckets are 16/32/64/128; 60 new
+    tokens from a 5-token prompt crosses three of them.
+    """
+    cfg = _mini_config()
+    torch.manual_seed(0)
+    prompt = torch.randint(0, cfg.vocab_size, (5,)).tolist()
+    max_new = 60
+
+    target_model = _mini_model(cfg, seed=42)
+    draft_model = _mini_model(cfg, seed=7)
+    greedy = SamplingConfig(mode=SamplingMode.GREEDY)
+
+    std_engine = _make_paged_engine(target_model)
+    std_req = LlamaRequest(req_id=0, prompt_ids=prompt, max_new_tokens=max_new)
+    std = std_engine.run_offline([std_req])[0]
+
+    t_engine = LlamaPagedEngine(target_model, n_total_blocks=200, block_size=16,
+                                eos_token=None, sampling=greedy, enable_cuda_graphs=True)
+    d_engine = LlamaPagedEngine(draft_model, n_total_blocks=200, block_size=16,
+                                eos_token=None, sampling=greedy, enable_cuda_graphs=True)
+    spec_engine = SpeculativePagedEngine(t_engine, d_engine, n_draft=n_draft, eos_token=None)
+    spec_req = LlamaRequest(req_id=0, prompt_ids=prompt, max_new_tokens=max_new)
+    spec = spec_engine.run_offline([spec_req])[0][0]
+
+    # More than one verify graph must have been captured, or the test is not
+    # exercising the boundary it exists to cover.
+    assert len(t_engine._verify_graphs) > 1, (
+        f"only captured {len(t_engine._verify_graphs)} verify graph(s) — "
+        "generation did not cross a len_bucket boundary"
+    )
+    first_diff = next((i for i, (a, b) in enumerate(zip(std, spec)) if a != b), None)
+    assert spec == std, (
+        f"n_draft={n_draft}: greedy spec diverged from standard at index {first_diff}\n"
+        f"  standard: {std[:first_diff + 3] if first_diff is not None else std}\n"
+        f"  spec:     {spec[:first_diff + 3] if first_diff is not None else spec}"
+    )

@@ -308,6 +308,7 @@ class PagedLlamaKVCache:
 
     def build_static_buffers(
         self, seq_ids: list[int], bucket_size: int, capture_len: int, device: str,
+        write_len: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build padded ``(block_table, seq_lens)`` tensors for one decode bucket.
 
@@ -320,6 +321,22 @@ class PagedLlamaKVCache:
         ``capture_len // block_size``) repeat that sequence's own block 0 —
         always a valid, allocated block; ``attn_mask`` hides the unwritten
         positions from SDPA so their content never affects the result.
+
+        **Column padding is safe for reads only.** A forward that *writes* KV
+        through a padded column aliases the sequence's own block 0 and silently
+        corrupts its first ``block_size`` positions. Callers that write must
+        allocate first (``ensure_slot`` / ``ensure_slots_for``) and pass
+        ``write_len`` — the number of positions this forward will write starting
+        at ``seq_lens[sid]`` — so the invariant is checked rather than assumed.
+
+        Args:
+            seq_ids:     Sequences to include, in batch-lane order.
+            bucket_size: Batch lanes in the captured graph (rows are padded to this).
+            capture_len: KV-gather length of the bucket; must be a multiple of
+                         ``block_size``.
+            device:      Device for the returned tensors.
+            write_len:   Positions this forward will write per sequence (0 for
+                         read-only / gather-only uses).
         """
         bs = self.manager.block_size
         if capture_len % bs != 0:
@@ -332,11 +349,20 @@ class PagedLlamaKVCache:
         rows_lens: list[int] = []
         for sid in seq_ids:
             phys = self.block_table[sid]
+            length = self.seq_lens[sid]
+            if write_len and self.manager.blocks_needed(length + write_len) > len(phys):
+                raise ValueError(
+                    f"seq {sid}: writing {write_len} positions from {length} needs "
+                    f"{self.manager.blocks_needed(length + write_len)} blocks but only "
+                    f"{len(phys)} are allocated — call ensure_slots_for() first. "
+                    f"Writing through padded columns would corrupt positions "
+                    f"0..{bs - 1} of this sequence."
+                )
             row = list(phys[:n_blocks_cap])
             if len(row) < n_blocks_cap:
                 row += [phys[0]] * (n_blocks_cap - len(row))
             rows_blocks.append(row)
-            rows_lens.append(self.seq_lens[sid])
+            rows_lens.append(length)
 
         while len(rows_blocks) < bucket_size:
             rows_blocks.append(rows_blocks[-1])

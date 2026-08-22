@@ -377,8 +377,10 @@ class LlamaPagedEngine:
         """Fresh (non-static) tensors for this bucket — used both to seed a new
         graph's static buffers and to refill them before each replay."""
         A = len(seq_ids)
+        # Decode graphs write one position per sequence; callers ensure_slot()
+        # before every step, including the one that triggers capture.
         block_table_buf, seq_lens_buf = self.cache.build_static_buffers(
-            seq_ids, bucket_size, capture_len, self.device
+            seq_ids, bucket_size, capture_len, self.device, write_len=1
         )
         real_ids = torch.cat([self._active[sid][1] for sid in seq_ids]).view(A, 1)
         if A < bucket_size:
@@ -605,8 +607,10 @@ class LlamaPagedEngine:
         return logits[0]                                                 # (K+1, vocab)
 
     def _capture_verify_graph(self, len_bucket: int, q_len: int, seq_id: int) -> _CapturedVerifyGraph:
+        # Warmup and capture both write q_len positions into the real KV pool,
+        # so the caller must have allocated them already (write_len asserts it).
         block_table_buf, seq_lens_buf = self.cache.build_static_buffers(
-            [seq_id], 1, len_bucket, self.device
+            [seq_id], 1, len_bucket, self.device, write_len=q_len
         )
         L = int(seq_lens_buf[0].item())
         input_ids    = torch.zeros(1, q_len, dtype=torch.long, device=self.device)
@@ -657,14 +661,22 @@ class LlamaPagedEngine:
             return self._step_verify_eager(seq_id, verify_ids)
         _, len_bucket = bucket
 
+        # Allocate the q_len slots BEFORE capture, not after. Capture runs
+        # warmup forwards that *write* KV at positions L..L+q_len-1, and
+        # build_static_buffers pads not-yet-allocated block-table columns with
+        # the sequence's own block 0. Padding is harmless for reads (attn_mask
+        # hides those positions) but a write through it lands on the sequence's
+        # real positions 0..block_size-1 and destroys its prompt KV — silently,
+        # and only on the step that first needs a new (len_bucket, q_len).
+        self.cache.ensure_slots_for(seq_id, q_len)
+
         vg = self._verify_graphs.get((len_bucket, q_len))
         if vg is None:
             vg = self._capture_verify_graph(len_bucket, q_len, seq_id)
             self._verify_graphs[(len_bucket, q_len)] = vg
 
-        self.cache.ensure_slots_for(seq_id, q_len)
         block_table_buf, seq_lens_buf = self.cache.build_static_buffers(
-            [seq_id], 1, len_bucket, self.device
+            [seq_id], 1, len_bucket, self.device, write_len=q_len
         )
         vg.block_table_buf.copy_(block_table_buf)
         vg.seq_lens_buf.copy_(seq_lens_buf)
