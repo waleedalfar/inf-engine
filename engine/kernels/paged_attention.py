@@ -67,7 +67,7 @@ def _paged_flash_decode_kernel(
     stride_bt_b,
     stride_oa_b, stride_oa_h, stride_oa_s, stride_oa_m,
     stride_ol_b, stride_ol_h, stride_ol_s,
-    q_len, n_rep, split_len,
+    q_len, n_rep, split_len, head_dim,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -84,6 +84,9 @@ def _paged_flash_decode_kernel(
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, BLOCK_D)
+    # BLOCK_D is padded up to tl.dot's minimum contraction width (16), so the
+    # tail columns are inactive rather than real channels.
+    d_valid = offs_d < head_dim
     rep = offs_m // q_len
     tok = offs_m % q_len
     row_valid = offs_m < q_len * n_rep
@@ -96,7 +99,10 @@ def _paged_flash_decode_kernel(
              + (h_kv * n_rep + rep)[:, None] * stride_qh
              + tok[:, None] * stride_qt
              + offs_d[None, :])
-    q = tl.load(q_ptr, mask=row_valid[:, None], other=0.0).to(tl.float32)
+    # Loaded in the pool's native dtype: tl.dot accumulates in fp32 regardless,
+    # so bf16 operands hit bf16 tensor cores at full accumulator precision
+    # instead of being widened to fp32 (which also silently selects TF32).
+    q = tl.load(q_ptr, mask=row_valid[:, None] & d_valid[None, :], other=0.0)
 
     m_i = tl.full((BLOCK_M,), NEG_INF, dtype=tl.float32)
     l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
@@ -113,10 +119,11 @@ def _paged_flash_decode_kernel(
                   + h_kv * stride_kp_h
                   + off[:, None] * stride_kp_pos
                   + offs_d[None, :])
-        k = tl.load(KPool + kv_off, mask=in_range[:, None], other=0.0).to(tl.float32)
-        v = tl.load(VPool + kv_off, mask=in_range[:, None], other=0.0).to(tl.float32)
+        kv_mask = in_range[:, None] & d_valid[None, :]
+        k = tl.load(KPool + kv_off, mask=kv_mask, other=0.0)
+        v = tl.load(VPool + kv_off, mask=kv_mask, other=0.0)
 
-        qk = tl.dot(q, tl.trans(k)) * scale                      # (BLOCK_M, BLOCK_N)
+        qk = tl.dot(q, tl.trans(k), allow_tf32=False).to(tl.float32) * scale                      # (BLOCK_M, BLOCK_N)
         # Offset-causal: key j admitted iff j <= q_pos. Subsumes j < kv_len.
         admit = in_range[None, :] & (pos[None, :] <= q_pos[:, None])
         qk = tl.where(admit, qk, NEG_INF)
@@ -130,7 +137,7 @@ def _paged_flash_decode_kernel(
         p = tl.exp(qk - m_safe[:, None])
 
         l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v, allow_tf32=False).to(tl.float32)
         m_i = m_new
 
     # Store the split's *normalized* output plus its log-sum-exp, so the combine
@@ -141,7 +148,7 @@ def _paged_flash_decode_kernel(
 
     oa = (OutAcc + b * stride_oa_b + h_kv * stride_oa_h + s * stride_oa_s
           + offs_m[:, None] * stride_oa_m + offs_d[None, :])
-    tl.store(oa, acc, mask=row_valid[:, None])
+    tl.store(oa, acc, mask=row_valid[:, None] & d_valid[None, :])
     ol = OutLse + b * stride_ol_b + h_kv * stride_ol_h + s * stride_ol_s + offs_m
     tl.store(ol, lse, mask=row_valid)
 
@@ -152,7 +159,7 @@ def _combine_splits_kernel(
     stride_ia_b, stride_ia_h, stride_ia_s, stride_ia_m,
     stride_il_b, stride_il_h, stride_il_s,
     stride_ob, stride_oh, stride_ot,
-    q_len, n_rep,
+    q_len, n_rep, head_dim,
     N_SPLITS: tl.constexpr,
     SPLITS_POW2: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -164,6 +171,7 @@ def _combine_splits_kernel(
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, BLOCK_D)
+    d_valid = offs_d < head_dim
     # tl.arange needs a power-of-two extent, so round up and mask the tail —
     # split counts are not generally powers of two.
     offs_s = tl.arange(0, SPLITS_POW2)
@@ -187,7 +195,7 @@ def _combine_splits_kernel(
     for s in range(N_SPLITS):
         ap = (InAcc + b * stride_ia_b + h_kv * stride_ia_h + s * stride_ia_s
               + offs_m[:, None] * stride_ia_m + offs_d[None, :])
-        a = tl.load(ap, mask=row_valid[:, None], other=0.0)
+        a = tl.load(ap, mask=row_valid[:, None] & d_valid[None, :], other=0.0)
         ws = tl.load(InLse + b * stride_il_b + h_kv * stride_il_h + s * stride_il_s + offs_m,
                      mask=row_valid, other=NEG_INF)
         acc += a * tl.exp(ws - m_safe)[:, None]
@@ -195,7 +203,7 @@ def _combine_splits_kernel(
 
     op = (Out + b * stride_ob + (h_kv * n_rep + rep)[:, None] * stride_oh
           + tok[:, None] * stride_ot + offs_d[None, :])
-    tl.store(op, acc.to(Out.dtype.element_ty), mask=row_valid[:, None])
+    tl.store(op, acc.to(Out.dtype.element_ty), mask=row_valid[:, None] & d_valid[None, :])
 
 
 def _pick_splits(kv_len: int, n_ctas_per_split: int, target_ctas: int = 512) -> int:
@@ -247,14 +255,15 @@ def paged_flash_attention(
 
     rows = n_rep * q_len
     BLOCK_M = max(16, triton.next_power_of_2(rows))
-    BLOCK_D = triton.next_power_of_2(D)
+    # tl.dot requires a contraction dim of at least 16.
+    BLOCK_D = max(16, triton.next_power_of_2(D))
 
     if n_splits is None:
         n_splits = _pick_splits(int(kv_lens.max().item()), B * n_kv)
     max_len = block_table.shape[1] * page_size
     split_len = triton.cdiv(triton.cdiv(max_len, n_splits), block_n) * block_n
 
-    acc = torch.empty((B, n_kv, n_splits, BLOCK_M, D), device=q.device, dtype=torch.float32)
+    acc = torch.empty((B, n_kv, n_splits, BLOCK_M, BLOCK_D), device=q.device, dtype=torch.float32)
     lse = torch.empty((B, n_kv, n_splits, BLOCK_M), device=q.device, dtype=torch.float32)
     out = torch.empty_like(q)
 
@@ -267,7 +276,7 @@ def paged_flash_attention(
         block_table.stride(0),
         acc.stride(0), acc.stride(1), acc.stride(2), acc.stride(3),
         lse.stride(0), lse.stride(1), lse.stride(2),
-        q_len, n_rep, split_len,
+        q_len, n_rep, split_len, D,
         BLOCK_M=BLOCK_M, BLOCK_N=block_n, BLOCK_D=BLOCK_D, PAGE=page_size,
         num_warps=4, num_stages=2,
     )
@@ -276,7 +285,7 @@ def paged_flash_attention(
         acc.stride(0), acc.stride(1), acc.stride(2), acc.stride(3),
         lse.stride(0), lse.stride(1), lse.stride(2),
         out.stride(0), out.stride(1), out.stride(2),
-        q_len, n_rep,
+        q_len, n_rep, D,
         N_SPLITS=n_splits, SPLITS_POW2=triton.next_power_of_2(n_splits),
         BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D,
         num_warps=4,

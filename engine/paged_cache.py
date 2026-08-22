@@ -34,6 +34,7 @@ import math
 import torch
 
 from engine.config import LlamaConfig
+from engine.kernels.paged_attention import paged_flash_attention
 
 
 class BlockManager:
@@ -372,6 +373,71 @@ class PagedLlamaKVCache:
         seq_lens_buf = torch.tensor(rows_lens, dtype=torch.long, device=device)
         return block_table_buf, seq_lens_buf
 
+    def write_static(
+        self,
+        layer: int,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        block_table_buf: torch.Tensor,
+        seq_lens_buf: torch.Tensor,
+    ) -> None:
+        """Write new K/V into physical blocks. Fixed-shape, graph-capturable.
+
+        The write half of ``extend_static``, split out so the fused paged
+        attention kernel can consume the pool directly instead of paying for a
+        contiguous gather it does not need.
+
+        Args:
+            k_new, v_new:    (A, n_kv_heads, q_len, head_dim). q_len is fixed at
+                             capture time so this loop unrolls into static ops.
+            block_table_buf: (A, capture_len // block_size) physical block ids.
+            seq_lens_buf:    (A,) token count *before* this write.
+        """
+        if layer not in self.owned_layers:
+            raise ValueError(f"layer {layer} not owned by this cache ({self.owned_layers})")
+        local_layer = layer - self.layer_offset
+        bs = self.manager.block_size
+        for q in range(k_new.shape[2]):
+            block_idx_q = (seq_lens_buf + q) // bs                           # (A,)
+            offset_q    = (seq_lens_buf + q) % bs                            # (A,)
+            phys_q = block_table_buf.gather(1, block_idx_q.unsqueeze(1)).squeeze(1)  # (A,)
+            self.k_pool[local_layer, phys_q, :, offset_q, :] = k_new[:, :, q, :]
+            self.v_pool[local_layer, phys_q, :, offset_q, :] = v_new[:, :, q, :]
+
+    def paged_attend(
+        self,
+        layer: int,
+        q: torch.Tensor,
+        block_table_buf: torch.Tensor,
+        kv_lens: torch.Tensor,
+        n_splits: int | None = None,
+    ) -> torch.Tensor:
+        """Attend against this layer's pool through the block table.
+
+        Assumes the current step's K/V are already written (``write_static``).
+        Reads the pool in place — no contiguous gather, no GQA expansion — so
+        cost tracks each sequence's true length rather than the captured bucket.
+
+        Args:
+            layer:           Absolute model layer index.
+            q:               (A, n_head, q_len, head_dim).
+            block_table_buf: (A, n_blocks) physical block ids.
+            kv_lens:         (A,) valid KV positions *including* this write.
+            n_splits:        KV splits; must be constant across a CUDA-graph
+                             capture. None lets the kernel choose.
+
+        Returns:
+            (A, n_head, q_len, head_dim), same dtype as ``q``.
+        """
+        if layer not in self.owned_layers:
+            raise ValueError(f"layer {layer} not owned by this cache ({self.owned_layers})")
+        local_layer = layer - self.layer_offset
+        return paged_flash_attention(
+            q, self.k_pool[local_layer], self.v_pool[local_layer],
+            block_table_buf, kv_lens,
+            page_size=self.manager.block_size, n_splits=n_splits,
+        )
+
     def extend_static(
         self,
         layer: int,
@@ -396,18 +462,10 @@ class PagedLlamaKVCache:
         Returns:
             ``(k_out, v_out)``, each ``(A, n_kv_heads, capture_len, head_dim)``.
         """
-        if layer not in self.owned_layers:
-            raise ValueError(f"layer {layer} not owned by this cache ({self.owned_layers})")
+        self.write_static(layer, k_new, v_new, block_table_buf, seq_lens_buf)
+
         local_layer = layer - self.layer_offset
         bs = self.manager.block_size
-        q_len = k_new.shape[2]
-        for q in range(q_len):
-            block_idx_q = (seq_lens_buf + q) // bs                           # (A,)
-            offset_q    = (seq_lens_buf + q) % bs                            # (A,)
-            phys_q = block_table_buf.gather(1, block_idx_q.unsqueeze(1)).squeeze(1)  # (A,)
-            self.k_pool[local_layer, phys_q, :, offset_q, :] = k_new[:, :, q, :]
-            self.v_pool[local_layer, phys_q, :, offset_q, :] = v_new[:, :, q, :]
-
         n_blocks_cap = capture_len // bs
         phys_all = block_table_buf[:, :n_blocks_cap]                      # (A, n_blocks_cap)
         k_gathered = self.k_pool[local_layer, phys_all]      # (A, n_blocks_cap, n_kv_heads, bs, head_dim)

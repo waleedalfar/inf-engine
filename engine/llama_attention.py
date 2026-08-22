@@ -130,6 +130,17 @@ def llama_attention(
     k = k.transpose(1, 2)                                          # (B, n_kv_heads, T_q, head_dim)
     v = v.transpose(1, 2)                                          # (B, n_kv_heads, T_q, head_dim)
 
+    # --- Fused paged attention (preferred) --------------------------------
+    # A paged cache can write K/V and attend straight out of the physical pool,
+    # skipping both the contiguous gather and the GQA expansion below, and
+    # costing time proportional to each sequence's true length rather than the
+    # captured bucket. Its masking is offset-causal per sequence from kv_lens,
+    # so it also subsumes the explicit attn_mask the graph paths pass.
+    if cache is not None and hasattr(cache, "fused_attend"):
+        out = cache.fused_attend(layer_idx, q, k, v)              # (B, n_head, T_q, head_dim)
+        out = out.transpose(1, 2).contiguous().view(B, T_q, n_head * head_dim)
+        return linear(out, weights["self_attn.o_proj.weight"])
+
     # --- KV cache: append new K/V (stored at n_kv_heads), retrieve full history ---
     if cache is not None:
         k, v = cache.extend(layer_idx, k, v, start_pos)           # (B, n_kv_heads, T_total, d)

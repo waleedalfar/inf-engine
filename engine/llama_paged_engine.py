@@ -41,6 +41,17 @@ def _default_graph_len_buckets(n_ctx: int, block_size: int) -> list[int]:
     return sorted(set(buckets))
 
 
+def _splits_for(capture_len: int, batch: int, n_kv: int, target_ctas: int = 512) -> int:
+    """KV splits for a captured graph's shape.
+
+    Must be a Python int fixed at capture time. Chosen so ``batch * n_kv *
+    splits`` comfortably fills the GPU, while each split still covers enough
+    positions to amortize its share of the combine.
+    """
+    base = max(1, target_ctas // max(batch * n_kv, 1))
+    return max(1, min(base, max(1, capture_len // 128), 64))
+
+
 def _as_id_row(ids: list[int] | torch.Tensor, device: str) -> torch.Tensor:
     """Normalise a token-id sequence to a ``(1, T)`` long tensor on ``device``.
 
@@ -82,33 +93,24 @@ class _CapturedVerifyGraph:
     q_len: int
 
 
-class _GraphVerifyCache:
-    """Like ``_GraphDecodeCache`` but for verify steps where q_len = K+1 > 1."""
+class _StaticBufferCache:
+    """Routes ``LlamaModel.forward``'s cache calls through fixed static buffers.
 
-    def __init__(
-        self,
-        real_cache: PagedLlamaKVCache,
-        block_table_buf: torch.Tensor,
-        seq_lens_buf: torch.Tensor,
-        capture_len: int,
-    ) -> None:
-        self._real = real_cache
-        self.block_table_buf = block_table_buf
-        self.seq_lens_buf = seq_lens_buf
-        self.capture_len = capture_len
+    This is the piece that makes a whole decode/verify forward CUDA-graph
+    capturable (see paged_cache.py's "CUDA-graph-safe decode path" for why the
+    normal ``extend()`` Python-loop implementation cannot be captured safely).
 
-    def extend(self, layer: int, k_new: torch.Tensor, v_new: torch.Tensor, start_pos: int = 0):
-        return self._real.extend_static(
-            layer, k_new, v_new, self.block_table_buf, self.seq_lens_buf, self.capture_len,
-        )
+    Two paths out of here:
 
+    * ``fused_attend`` — writes K/V, then attends against the pool in place with
+      the paged flash-decoding kernel. No contiguous gather, no GQA expansion,
+      and cost tracks the true sequence length rather than ``capture_len``.
+      ``llama_attention`` prefers this whenever it exists.
+    * ``extend`` — the older write-then-gather path, kept as the fallback for
+      head dims the kernel does not handle.
 
-class _GraphDecodeCache:
-    """Adapter routing ``LlamaModel.forward``'s ``cache.extend(...)`` calls through
-    ``PagedLlamaKVCache.extend_static`` against a fixed pair of static buffers —
-    the piece that makes a whole decode forward pass CUDA-graph capturable
-    (see paged_cache.py's "CUDA-graph-safe decode path" section for why the
-    normal ``extend()`` Python-loop implementation can't be captured safely).
+    ``n_splits`` is fixed at construction because it must be constant across a
+    CUDA-graph capture.
     """
 
     def __init__(
@@ -122,11 +124,31 @@ class _GraphDecodeCache:
         self.block_table_buf = block_table_buf
         self.seq_lens_buf = seq_lens_buf
         self.capture_len = capture_len
+        self.n_splits = _splits_for(capture_len, seq_lens_buf.shape[0],
+                                    real_cache.config.n_kv_heads)
 
     def extend(self, layer: int, k_new: torch.Tensor, v_new: torch.Tensor, start_pos: int = 0):
         return self._real.extend_static(
             layer, k_new, v_new, self.block_table_buf, self.seq_lens_buf, self.capture_len,
         )
+
+    def fused_attend(
+        self, layer: int, q: torch.Tensor, k_new: torch.Tensor, v_new: torch.Tensor
+    ) -> torch.Tensor:
+        self._real.write_static(layer, k_new, v_new, self.block_table_buf, self.seq_lens_buf)
+        kv_lens = self.seq_lens_buf + k_new.shape[2]
+        return self._real.paged_attend(
+            layer, q, self.block_table_buf, kv_lens, self.n_splits
+        )
+
+
+# Kept as distinct names so tracebacks and the graph caches stay readable.
+class _GraphVerifyCache(_StaticBufferCache):
+    """Static-buffer cache for verify steps, where q_len = K+1 > 1."""
+
+
+class _GraphDecodeCache(_StaticBufferCache):
+    """Static-buffer cache for q_len=1 decode steps."""
 
 
 @dataclass
