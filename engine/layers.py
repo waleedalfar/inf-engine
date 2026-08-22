@@ -7,11 +7,18 @@ from __future__ import annotations
 
 import torch
 
+from engine.kernels.rms_norm import MAX_FUSED_COLS, triton_rms_norm
+
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """RMS normalization (LLaMA-style): no mean subtraction, no bias.
 
     rms_norm(x) = x / sqrt(mean(x²) + eps) * weight
+
+    On CUDA this dispatches to a fused Triton kernel (one launch instead of the
+    six the torch expression below compiles to). The kernel also accumulates in
+    float32, matching the reference HuggingFace implementation — the torch path
+    reduces in the input dtype, which costs precision on bf16 activations.
 
     Args:
         x:      Input. Shape: (..., d_model)
@@ -21,8 +28,11 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     Returns:
         Normalized tensor. Shape: (..., d_model)
     """
-    rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)  # (..., 1)
-    return (x / rms) * weight                                      # (..., d_model)
+    if x.is_cuda and x.shape[-1] <= MAX_FUSED_COLS and x.numel() > 0:
+        return triton_rms_norm(x, weight, eps)
+    x_f = x.float()
+    rms = torch.sqrt(x_f.pow(2).mean(dim=-1, keepdim=True) + eps)  # (..., 1)
+    return ((x_f / rms) * weight.float()).to(x.dtype)              # (..., d_model)
 
 
 def silu(x: torch.Tensor) -> torch.Tensor:

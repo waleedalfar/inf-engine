@@ -94,15 +94,23 @@ def llama_attention(
     k = linear(x, weights["self_attn.k_proj.weight"])              # (B, T_q, n_kv_heads*head_dim)
     v = linear(x, weights["self_attn.v_proj.weight"])              # (B, T_q, n_kv_heads*head_dim)
 
-    # --- reshape to (B, heads, T, head_dim) ---
-    q = q.view(B, T_q, n_head,    head_dim).transpose(1, 2)       # (B, n_head,    T_q, head_dim)
-    k = k.view(B, T_q, n_kv_heads, head_dim).transpose(1, 2)      # (B, n_kv_heads, T_q, head_dim)
-    v = v.view(B, T_q, n_kv_heads, head_dim).transpose(1, 2)      # (B, n_kv_heads, T_q, head_dim)
+    # --- split into heads, still token-major: (B, T, heads, head_dim) ---
+    q = q.view(B, T_q, n_head,     head_dim)
+    k = k.view(B, T_q, n_kv_heads, head_dim)
+    v = v.view(B, T_q, n_kv_heads, head_dim)
 
     # --- QK-norm (Qwen3): per-head RMSNorm on Q and K before RoPE ---
+    # Applied here rather than after the transpose below: RMSNorm reduces over
+    # head_dim either way, but on this side the rows are contiguous, so the
+    # fused kernel reads them directly instead of forcing a copy.
     if config.qk_norm:
         q = rms_norm(q, weights["self_attn.q_norm.weight"], config.norm_eps)
         k = rms_norm(k, weights["self_attn.k_norm.weight"], config.norm_eps)
+
+    # --- to (B, heads, T, head_dim) for attention ---
+    q = q.transpose(1, 2)                                          # (B, n_head,     T_q, head_dim)
+    k = k.transpose(1, 2)                                          # (B, n_kv_heads, T_q, head_dim)
+    v = v.transpose(1, 2)                                          # (B, n_kv_heads, T_q, head_dim)
 
     # --- RoPE: rotate Q and K by their absolute positions ---
     q, k = apply_rope(q, k, cos, sin, position_ids)
