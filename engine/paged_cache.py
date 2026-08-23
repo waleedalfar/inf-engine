@@ -115,9 +115,20 @@ class PagedLlamaKVCache:
         dtype: torch.dtype,
         owned_layers: range | None = None,
         kv_dtype: torch.dtype | None = None,
+        attn_window: int = 0,
+        attn_sinks: int = 4,
     ) -> None:
         """
         Args:
+            attn_window: Sliding-window attention size, 0 for unlimited. Only
+                meaningful on a speculative *draft* engine: the draft proposes
+                and the target verifies, so accept/reject still yields the
+                target's exact distribution — a narrower draft context costs
+                acceptance rate and nothing else. At 32k context the draft is 65%
+                of per-step KV traffic despite being a 0.6B model, because it has
+                the same 8 KV heads x 128 head_dim as the 8B target.
+            attn_sinks: Leading positions always attended when windowed.
+                Windowed attention degrades sharply without a few of these.
             kv_dtype: Storage dtype for the K/V pool. Defaults to ``dtype``.
                 Pass ``torch.int8`` (preferred) or ``torch.float8_e4m3fn``
                 to halve the pool — and, more to
@@ -168,6 +179,8 @@ class PagedLlamaKVCache:
         # rather than the process — a global cache handed one engine's graph a
         # buffer allocated inside another's private pool.
         self._attn_scratch: dict = {}
+        self.attn_window = attn_window
+        self.attn_sinks = attn_sinks if attn_window else 0
 
     # ------------------------------------------------------------------
     # Sequence lifecycle
@@ -544,6 +557,7 @@ class PagedLlamaKVCache:
             k_scale=self.k_scale[local_layer] if self.quantized else None,
             v_scale=self.v_scale[local_layer] if self.quantized else None,
             n_splits=n_splits, scratch=self._attn_scratch,
+            window=self.attn_window, n_sink=self.attn_sinks,
         )
 
     def extend_static(

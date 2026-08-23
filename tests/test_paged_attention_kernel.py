@@ -263,3 +263,101 @@ def test_fp8_pool_halves_kv_bytes():
         f"expected INT8 pool to be half of bf16: {fp8_bytes} vs {bf16_bytes}"
     )
     assert mk(FP8).quantized is True and mk(None).quantized is False
+
+
+# ---------------------------------------------------------------------------
+# Sliding window + attention sinks
+# ---------------------------------------------------------------------------
+
+def _reference_windowed(q, k_ref, v_ref, kv_len, q_len, n_rep, window, n_sink):
+    """SDPA with an explicit windowed offset-causal mask."""
+    k = k_ref[:, :, :kv_len]
+    v = v_ref[:, :, :kv_len]
+    if n_rep > 1:
+        b_, h_, t_, d_ = k.shape
+        k = k[:, :, None].expand(b_, h_, n_rep, t_, d_).reshape(b_, h_ * n_rep, t_, d_)
+        v = v[:, :, None].expand(b_, h_, n_rep, t_, d_).reshape(b_, h_ * n_rep, t_, d_)
+    start = kv_len - q_len
+    rows = torch.arange(q_len, device=DEV)
+    cols = torch.arange(kv_len, device=DEV)
+    causal = cols[None, :] <= (rows[:, None] + start)
+    lo = max(start - window + 1, 0)
+    keep = (cols[None, :] >= lo) | (cols[None, :] < n_sink)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=(causal & keep)[None, None])
+
+
+@pytest.mark.parametrize("window", [16, 64, 257])
+@pytest.mark.parametrize("q_len", [1, 5])
+def test_window_matches_windowed_sdpa(window, q_len):
+    """Windowed kernel must match SDPA with the same explicit mask."""
+    B, n_head, n_kv, kv_len, D, page = 1, 8, 2, 600, 64, 16
+    n_sink = 4
+    q, kp, vp, bt, kr, vr = _build(B, n_head, n_kv, q_len, kv_len, D, page, seed=window)
+    kv_lens = torch.full((B,), kv_len, dtype=torch.int32, device=DEV)
+
+    got = paged_flash_attention(q, kp, vp, bt, kv_lens, page_size=page,
+                                window=window, n_sink=n_sink)
+    want = _reference_windowed(q, kr, vr, kv_len, q_len, n_head // n_kv, window, n_sink)
+
+    assert torch.isfinite(got.float()).all()
+    torch.testing.assert_close(got.float(), want.float(), rtol=2e-2, atol=2e-2)
+
+
+def test_window_zero_is_unlimited():
+    """window=0 must reproduce the unwindowed path exactly."""
+    B, n_head, n_kv, q_len, kv_len, D, page = 1, 8, 2, 5, 500, 64, 16
+    q, kp, vp, bt, kr, vr = _build(B, n_head, n_kv, q_len, kv_len, D, page, seed=1)
+    kv_lens = torch.full((B,), kv_len, dtype=torch.int32, device=DEV)
+    a = paged_flash_attention(q, kp, vp, bt, kv_lens, page_size=page)
+    b = paged_flash_attention(q, kp, vp, bt, kv_lens, page_size=page, window=0, n_sink=4)
+    torch.testing.assert_close(a.float(), b.float(), rtol=0, atol=0)
+
+
+def test_window_larger_than_context_is_unlimited():
+    B, n_head, n_kv, q_len, kv_len, D, page = 1, 8, 2, 3, 200, 64, 16
+    q, kp, vp, bt, kr, vr = _build(B, n_head, n_kv, q_len, kv_len, D, page, seed=2)
+    kv_lens = torch.full((B,), kv_len, dtype=torch.int32, device=DEV)
+    a = paged_flash_attention(q, kp, vp, bt, kv_lens, page_size=page)
+    b = paged_flash_attention(q, kp, vp, bt, kv_lens, page_size=page,
+                              window=10_000, n_sink=4)
+    torch.testing.assert_close(a.float(), b.float(), rtol=2e-2, atol=2e-2)
+
+
+def test_window_actually_excludes_distant_keys():
+    """A key outside the window must have zero influence.
+
+    Perturbing an excluded position must leave the output bit-identical; an
+    off-by-one in the bound would let it through.
+    """
+    B, n_head, n_kv, q_len, kv_len, D, page = 1, 4, 1, 1, 400, 64, 16
+    window, n_sink = 32, 4
+    q, kp, vp, bt, kr, vr = _build(B, n_head, n_kv, q_len, kv_len, D, page, seed=3)
+    kv_lens = torch.full((B,), kv_len, dtype=torch.int32, device=DEV)
+    base = paged_flash_attention(q, kp, vp, bt, kv_lens, page_size=page,
+                                 window=window, n_sink=n_sink)
+
+    # Position 200 is inside the history, outside [kv_len-window, kv_len), and
+    # past the sinks — so it must be invisible.
+    excluded = 200
+    assert n_sink <= excluded < kv_len - window
+    phys = int(bt[0, excluded // page])
+    vp[phys, :, excluded % page, :] += 100.0
+    after = paged_flash_attention(q, kp, vp, bt, kv_lens, page_size=page,
+                                  window=window, n_sink=n_sink)
+    torch.testing.assert_close(after.float(), base.float(), rtol=0, atol=0)
+
+
+def test_sink_tokens_are_admitted():
+    """Perturbing a sink position must change the output, else sinks are dead."""
+    B, n_head, n_kv, q_len, kv_len, D, page = 1, 4, 1, 1, 400, 64, 16
+    window, n_sink = 32, 4
+    q, kp, vp, bt, kr, vr = _build(B, n_head, n_kv, q_len, kv_len, D, page, seed=4)
+    kv_lens = torch.full((B,), kv_len, dtype=torch.int32, device=DEV)
+    base = paged_flash_attention(q, kp, vp, bt, kv_lens, page_size=page,
+                                 window=window, n_sink=n_sink)
+    phys = int(bt[0, 0])
+    vp[phys, :, 1, :] += 100.0          # position 1 — a sink
+    after = paged_flash_attention(q, kp, vp, bt, kv_lens, page_size=page,
+                                  window=window, n_sink=n_sink)
+    assert not torch.allclose(after.float(), base.float()), \
+        "sink position had no influence — n_sink is not wired through"

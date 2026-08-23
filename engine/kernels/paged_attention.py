@@ -76,15 +76,35 @@ def _paged_flash_decode_kernel(
     PAGE: tl.constexpr,
     SINGLE_SPLIT: tl.constexpr,
     QUANT_KV: tl.constexpr,
+    WINDOW: tl.constexpr,
+    N_SINK: tl.constexpr,
 ):
     """One program = (batch, kv_head, kv_split). Emits a normalized partial + lse."""
     b = tl.program_id(0)
     h_kv = tl.program_id(1)
     s = tl.program_id(2)
 
-    kv_len = tl.load(KVLens + b)
-    start = s * split_len
+    # int64 throughout: `end` is reassigned below and Triton requires the types
+    # to match across that assignment.
+    kv_len = tl.load(KVLens + b).to(tl.int64)
+    start = (s * split_len).to(tl.int64)
     end = tl.minimum(start + split_len, kv_len)
+
+    # Sliding-window bound. WINDOW == 0 means unlimited (the target model), and
+    # being constexpr the whole thing compiles away in that case.
+    #
+    # Rows admit keys in [lo, q_pos] plus the first N_SINK "attention sink"
+    # positions, which carry disproportionate attention mass and whose removal
+    # degrades windowed attention far more than their count suggests
+    # (StreamingLLM). lo is derived from the *earliest* query row, so no row
+    # loses a key it is entitled to.
+    if WINDOW > 0:
+        lo = tl.maximum((kv_len - q_len) - WINDOW + 1, tl.zeros((), tl.int64))
+        # A split lying entirely below the window and above the sinks
+        # contributes nothing — skip its loads rather than mask them away.
+        # This is where the traffic saving actually comes from.
+        if start >= N_SINK and end <= lo:
+            end = start
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, BLOCK_D)
@@ -147,6 +167,8 @@ def _paged_flash_decode_kernel(
             qk = tl.dot(q, tl.trans(k), allow_tf32=False).to(tl.float32) * scale                      # (BLOCK_M, BLOCK_N)
         # Offset-causal: key j admitted iff j <= q_pos. Subsumes j < kv_len.
         admit = in_range[None, :] & (pos[None, :] <= q_pos[:, None])
+        if WINDOW > 0:
+            admit = admit & ((pos[None, :] >= lo) | (pos[None, :] < N_SINK))
         qk = tl.where(admit, qk, NEG_INF)
 
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
@@ -258,6 +280,8 @@ def paged_flash_attention(
     n_splits: int | None = None,
     block_n: int = 64,
     scratch: dict | None = None,
+    window: int = 0,
+    n_sink: int = 0,
 ) -> torch.Tensor:
     """GQA-native paged attention over a KV history held in physical blocks.
 
@@ -278,6 +302,17 @@ def paged_flash_attention(
         n_splits:    KV splits. Must be a Python int (constant per CUDA-graph
                      capture); defaults to a heuristic from ``kv_lens.max()``.
         block_n:     KV positions processed per inner iteration.
+        window:      Sliding-window size, or 0 for unlimited. Each query admits
+                     only the last ``window`` keys, plus the first ``n_sink``.
+                     Intended for a *speculative draft* model: the draft only
+                     proposes, and the target's accept/reject still yields the
+                     target's exact distribution, so a narrower draft context
+                     costs acceptance rate and nothing else. Splits that fall
+                     entirely outside the window skip their loads.
+        n_sink:      Leading positions always admitted. Windowed attention
+                     degrades sharply without a few of these — they absorb
+                     attention mass that would otherwise be forced onto the
+                     window (StreamingLLM). 4 is the usual choice.
         scratch:     Caller-owned dict for the split-partial workspace, so its
                      lifetime is the caller's. **Required for CUDA-graph use.**
                      A graph bakes in the pointer at capture time, so the buffer
@@ -339,7 +374,8 @@ def paged_flash_attention(
         out.stride(0), out.stride(1), out.stride(2),
         q_len, n_rep, split_len, D,
         BLOCK_M=BLOCK_M, BLOCK_N=block_n, BLOCK_D=BLOCK_D, PAGE=page_size,
-        SINGLE_SPLIT=single, QUANT_KV=quant, num_warps=4, num_stages=2,
+        SINGLE_SPLIT=single, QUANT_KV=quant,
+        WINDOW=window, N_SINK=n_sink, num_warps=4, num_stages=2,
     )
     if single:
         return out

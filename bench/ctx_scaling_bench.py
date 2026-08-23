@@ -126,6 +126,13 @@ def main() -> None:
                          "term that dominates long context. Safe: the draft only "
                          "proposes; accept/reject still yields the target's exact "
                          "distribution.")
+    ap.add_argument("--draft-window", type=int, default=0,
+                    help="Sliding-window attention for the DRAFT only (0 = full "
+                         "context). The draft proposes and the target verifies, so "
+                         "accept/reject still yields the target's exact "
+                         "distribution — this costs acceptance rate, never "
+                         "correctness. At 32k the draft is 65%% of per-step KV "
+                         "traffic despite being a 0.6B model.")
     ap.add_argument("--target-kv-int8", action="store_true",
                     help="Also store the TARGET's KV in INT8. This changes the "
                          "model's own output distribution — quality-gate it.")
@@ -160,7 +167,8 @@ def main() -> None:
     print(f"\ncorpus {corpus_digest} (acceptance is comparable across runs only "
           f"when this matches)")
     print(f"generating {N} tokens per point, "
-          f"draft KV={'int8' if d_kv else 'bf16'}, target KV={'int8' if t_kv else 'bf16'}")
+          f"draft KV={'int8' if d_kv else 'bf16'}, target KV={'int8' if t_kv else 'bf16'}, "
+          f"draft window={args.draft_window or 'full'}")
     total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     print(f"{'prompt':>8}{'end ctx':>9}{'K':>4}{'sl':>4}{'prefill ms':>12}{'decode ms/step':>16}"
           f"{'decode tok/s':>14}{'e2e tok/s':>11}{'accept':>8}{'tok/step':>10}"
@@ -186,7 +194,8 @@ def main() -> None:
                                  enable_cuda_graphs=True, kv_dtype=t_kv)
             d = LlamaPagedEngine(draft, n_total_blocks=n_blocks, block_size=16,
                                  eos_token=None, sampling=greedy,
-                                 enable_cuda_graphs=True, kv_dtype=d_kv)
+                                 enable_cuda_graphs=True, kv_dtype=d_kv,
+                                 attn_window=args.draft_window)
             return SpeculativePagedEngine(t, d, n_draft=n_draft, eos_token=None)
 
         torch.cuda.empty_cache()

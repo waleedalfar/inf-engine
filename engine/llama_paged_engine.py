@@ -193,6 +193,10 @@ class LlamaPagedEngine:
         graph_len_buckets: Candidate KV-gather lengths, must be multiples of
                          block_size (default: power-of-two block multiples
                          up to model.config.n_ctx).
+        attn_window:     Sliding-window attention, 0 for unlimited. Use on a
+                         speculative *draft* engine only — see
+                         PagedLlamaKVCache. Costs acceptance rate, never
+                         correctness, because the target verifies every token.
         prefill_chunk:   Tokens per prefill forward. Bounds activation memory,
                          which otherwise grows with prompt length — the fused
                          gate_up projection alone is 2.16 GB at 24k tokens.
@@ -221,6 +225,7 @@ class LlamaPagedEngine:
         graph_len_buckets: list[int] | None = None,
         kv_dtype: torch.dtype | None = None,
         prefill_chunk: int = 2048,
+        attn_window: int = 0,
     ) -> None:
         self.model = model
         device = str(model.w.embed_tokens.device)
@@ -229,7 +234,7 @@ class LlamaPagedEngine:
         self.prefill_chunk = prefill_chunk
         self.manager = BlockManager(n_total_blocks, block_size)
         self.cache = PagedLlamaKVCache(model.config, self.manager, device, dtype,
-                                       kv_dtype=kv_dtype)
+                                       kv_dtype=kv_dtype, attn_window=attn_window)
         self.cfg = sampling or SamplingConfig()
         self.eos = eos_token
         self.max_queue_depth = max_queue_depth
