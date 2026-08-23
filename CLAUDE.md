@@ -23,6 +23,25 @@ and measure. Give it the full attempt.
 
 ---
 
+## Progress
+
+| date | change | 4296 ctx | 8392 ctx |
+|---|---|---|---|
+| baseline | SDPA gather + expand | 16.7 | 10.6 |
+| 2026-08-22 | paged flash-decoding kernel | 71.7 | 53.3 |
+| 2026-08-22 | + INT8 draft KV | **82.2** | **73.9** |
+
+(decode tok/s, 200 generated; acceptance 63–67% on these prompts, so at the
+3.16 tok/step a well-matched prompt gives, 4296 is ≈100.)
+
+Done: the custom kernel (item 3), INT8 KV (item 4). The kernel subsumed items 1
+and 2 — it reads the block table directly, so there is no gather to pad and no
+expansion to avoid; splits past the true length exit immediately.
+
+Remaining: context-dependent `n_draft` (item 5), 64K enablement (item 6), and
+the INT4 matmul, which is now ~69% of the target verify step and is the largest
+context-independent cost.
+
 ## Why the old numbers don't transfer
 
 Everything before 2026-08-22 optimized a **239-token** context (39-token prompt,
@@ -79,19 +98,13 @@ gives back exactly the bandwidth it saved).
 
 ## The work, in order
 
-### 1. Finer `len_bucket` granularity
-`_default_graph_len_buckets` uses powers of two — up to 2× wasted gather at long
-context, since attention cost scales with the captured bucket, not the true
-length. Replace with a scheme whose relative padding stays bounded (e.g. ~1.25×
-steps above 1K). Watch captured-graph count and VRAM.
+### 1-2. Bucket padding and the GQA fold — SUBSUMED by the kernel
+Both existed to work around the gather. The kernel reads the block table
+directly, so there is no contiguous gather to pad and no expansion to avoid, and
+splits past a sequence's true length exit immediately. Neither was implemented;
+neither is needed.
 
-### 2. GQA fold (validated, 1.47× at 4–8K, bit-identical)
-Instead of `repeat_kv` expanding K/V 4×, fold the GQA group into the query rows:
-view `q` as `(B, n_kv, n_rep*T_q, D)` and attend against the narrow K/V directly.
-Mask row `r` corresponds to token `r % T_q`. Verified `max|Δ| = 0`.
-Stopgap until step 3 lands; delete it if the custom kernel supersedes it.
-
-### 3. Custom flash-decoding attention kernel — THE CENTREPIECE
+### 3. Custom flash-decoding attention kernel — DONE (`engine/kernels/paged_attention.py`)
 Triton, in `engine/kernels/`. Requirements:
 - **GQA-native**: reads `n_kv` heads directly, never materializes an expansion.
 - **Split over the KV axis** (flash-decoding): a 1–5 row query cannot fill 70 SMs
@@ -110,13 +123,17 @@ Triton, in `engine/kernels/`. Requirements:
 softmax, but it is square-shaped, fp32, non-GQA — it is a teaching implementation,
 not a starting point to extend.
 
-### 4. FP8 KV cache
-Store the paged K/V pool in FP8 with per-block (or per-head) scales. Land it for
-the **draft first**: the draft only proposes, the target verifies, and the
-accept/reject step still guarantees the target's exact output distribution, so
-draft KV precision costs a little accept rate and nothing else. Target-side KV
-quantization changes the model's own distribution — treat it as a separate,
-quality-gated decision.
+### 4. 8-bit KV cache — DONE (`kv_dtype=torch.int8`)
+Per-(block, head, position) scales, read natively by the kernel. Landed on the
+draft, where it is free: the draft only proposes and accept/reject still yields
+the target's exact distribution. Acceptance was unchanged (66.7% vs 65.6%).
+
+**Use INT8, not FP8.** Both are one byte, but per-token amax scaling already
+supplies the exponent range FP8 spends bits on, so e4m3's 3 mantissa bits are
+strictly worse than INT8's effective 7.
+
+Target-side KV quantization changes the model's own distribution — still a
+separate, quality-gated decision (`--target-kv-int8` exists but is ungated).
 
 ### 5. Context-dependent `n_draft`
 Optimal `n_draft` falls as context grows, because every draft step now pays
@@ -152,6 +169,18 @@ in-graph `torch.profiler` time before believing any win.
 **Verify optimized paths actually run.** Assert the activation state and a
 side effect only the new path produces — not just that output matches the
 fallback, which passes just as well when the feature is silently off.
+
+**Never pass `.clone()`d tensors to a kernel test.** Cloning makes them
+contiguous and hides every stride bug. The quantized-KV write kernel addressed V
+through K's strides — which genuinely differ in the model, since K goes through
+QK-norm and RoPE and V does not — and four rounds of isolation tests all passed
+because each cloned its inputs. Test with tensors carrying the layout the caller
+actually produces, transposes and slices included.
+
+**Near-total output collapse is a bug, not quantization error.** Injected KV
+noise of 0.66% leaves argmax agreement at 100%, and even 10% leaves it at 78%.
+So 0.4% agreement is never "the format is too coarse" — measure the equivalent
+noise before accepting a precision explanation.
 
 ---
 
