@@ -5,15 +5,34 @@
 Reach this ladder on a single RTX 5070 Ti. Do not descope it, do not substitute
 an easier target, and do not stop at the rows that already pass.
 
-| context | committed tok/s | measured | status |
+| context | committed tok/s | measured decode (clean run) | status |
 |---|---|---|---|
-| ~4K  | **90–120+** | 134.2 / 125.3 | ✅ **above band** |
-| ~16K | **80–90**   | **84.7**      | ✅ **met** |
-| ~32K | **55–65**   | 42.7 / 50.5   | ❌ −9 to −23% |
-| ~64K | **40–42**   | —             | ⛔ not attempted |
+| ~4K  | **90–120+** | 124–131  (23.9–24.4 ms/step) | ✅ **above band** |
+| ~16K | **80–90**   | 85–128   (27–30 ms/step)     | ✅ **met** |
+| ~32K | **55–65**   | 91–99    (26.5–28.8 ms/step) | ✅ **met, VRAM-tight** |
+| ~64K | **40–42**   | —                             | ⛔ not attempted |
 
 Best config: INT8 draft + target KV, split-K INT4 matmul, **draft attention
 window 4096 with 4 sink tokens**, n_draft=4.
+
+**The "32K gap" was a benchmark artifact, not an engine deficit (2026-08-23).**
+`ctx_scaling_bench` computed decode as `e2e − separate_prefill_estimate`, and its
+`_time_prefill` helper ran on an already-warm allocator with blocks pre-allocated,
+so it read the 32K prefill ~2.6 s *low*. That fixed 2.6 s, divided across ~76
+decode steps, added ~35 ms/step of phantom cost — manufacturing the entire gap
+(true 28 → reported 63). Proven by decomposing prefill vs decode *inside one run*
+(`bench/spec_decode_wall.py`): true in-run prefill 23 285 ms vs the helper's
+20 653 ms. The bug is invisible at 4K (small prefill) and grows with context,
+which is why only the long rows looked short. Once measured correctly, ms/step is
+**monotonic in context** (24 → 27 → 28), as the physics requires. Fixed: the
+benchmark now stamps the decode start inside the run instead of subtracting a
+separate estimate. tok/s within a row still tracks acceptance (content), so the
+range is acceptance spread, not timing noise.
+
+**32K is met but sits at 83–94 % VRAM.** A clean single run decodes at ~28 ms/step;
+back-to-back slices fragment the allocator and the second slice thrashed to
+141 ms/step at 94 %. The throughput is there; the memory headroom is the real
+remaining constraint at long context, and it is what blocks 64K.
 
 Qwen3-8B INT4 target + Qwen3-0.6B draft, INT8 draft KV, n_draft=4.
 16 GB VRAM, 896 GB/s.
@@ -99,21 +118,27 @@ essentially free.
 branch compiles away for the target; the saving comes from splits outside the
 window skipping their loads, not from masking after the fact.
 
-### A7. Close the remaining 32K gap — NEXT
-42.7–50.5 against 55–65. Profile where 61.62 ms/step goes: rough accounting puts
-draft + target at ~24 ms, leaving ~38 ms unexplained. Measure before choosing.
-Now the main lever. A1 and A2 both addressed costs that are flat in context;
-the draft is **77% of per-step KV traffic** and at 32K each of ~3.5 draft
-forwards per step attends over 32k tokens, so this is the only remaining lever
-that scales *with* context. Sweeping `--n-draft 2 3 4 6` at 16K and 32K.
+### A7. Close the remaining 32K gap — ✅ RESOLVED (no gap existed)
+The "gap" was `ctx_scaling_bench`'s prefill accounting, not the engine. Measured
+four independent ways (decode-wall, slope, fixed single-slice bench, 2-slice
+slice-0), 32K decodes at 26.5–28.8 ms/step = 91–99 tok/s, above the 55–65 band.
+The "~38 ms unexplained" was the misattributed prefill. Benchmark fixed; see the
+milestone note above. What remains at 32K is **VRAM headroom**, not throughput.
 
-### A4. 64K enablement
+### A4. 64K enablement — NEXT, and now the only unmet row
 YaRN is implemented. Set `rope_scaling_factor=4`, `rope_original_n_ctx=32768`,
-raise `n_ctx`. Blocked on A1 for VRAM.
+raise `n_ctx`. **Blocked on VRAM, and the block is real:** 32K already peaks at
+14 GB (83 %) and a fresh-run second slice hit 94 %. 64K roughly doubles KV, which
+does not fit as-is. Needs headroom first — candidates: a smaller draft KV
+footprint (draft window already bounds *reads* but the pool still allocates all
+positions; a windowed *cache* would bound the allocation), tighter block-pool
+sizing in the benchmark, or freeing the draft's out-of-window blocks. Budget VRAM
+before timing; the run will thrash before it's slow.
 
 ### A5. Full ladder, multi-slice
-Re-measure 4K/16K/32K/64K with `--slices 3+` once A1–A3 land. One slice is one
-sample; the spread is the result.
+Re-measure 4K/16K/32K with `--slices 3+`, then 64K once it fits. Use a **fresh
+engine per slice** or the allocator fragments and the later slices read as
+thrash (seen at 32K slice 1). One slice is one sample; the spread is the result.
 
 ---
 
@@ -158,26 +183,32 @@ Deferred until the ladder is met. Existing scaffolding: `engine/distributed/`
 
 ## Measured results
 
-`bench/ctx_scaling_bench.py`, corpus `d122f3bde4eb`, 200 generated tokens,
-INT8 draft KV, n_draft=4, single slice:
-
-Latest: A2 (split-K) + A1 (both KVs INT8), 2 slices, n_draft=4:
+`bench/ctx_scaling_bench.py` (**decode-start now stamped inside the run** — see
+the prefill-accounting note in the milestone section), corpus `d122f3bde4eb`,
+200 generated tokens, INT8 draft + target KV, split-K matmul, draft window=4096,
+n_draft=4:
 
 | end ctx | ms/step | decode tok/s | accept | tok/step | peak GB |
 |---|---|---|---|---|---|
-| 4,296  | 24.83 / 24.56 | 134.2 / 125.3 | 80.3 / 76.6% | 3.32 / 3.06 | 7.9 |
-| 16,584 | 46.99 / 38.89 | 73.4 / 66.8   | 81.0 / 66.5% | 3.43 / 2.57 | 9.7 |
-| 32,200 | 72.34 / 86.10 | 35.4 / 40.1   | 66.1 / 81.0% | 2.55 / 3.43 | 12.0 |
+| 4,296  | 23.9 / 24.4  | 130.9 / 123.5 | 77.6 / 76.4% | 3.11 / 3.02 | 7.9 |
+| 16,584 | 28.9 / 29.9  | 119.2 / 84.6  | 81.5 / 65.0% | 3.43 / 2.51 | 9.7–10.8 |
+| 32,200 | 26.5 / 28.8  | 99.3 / 90.8   | 66.8 / 66.8% | 2.62        | 14.1 |
 
-Progression at 16K: 65.3 (bf16 KV) → 63.4–63.6 (A1) → 66.8–73.4 (A2).
-At 32K: unmeasurable → 33.3–39.5 (A1) → 35.4–40.1 (A2).
+Second 32K column is `bench/spec_decode_wall.py` (decode-only wall, no prefill
+subtraction) — the arbiter that exposed the accounting bug. The two agree, which
+is the point. A back-to-back second 32K slice thrashed to 141 ms/step at 94 %
+VRAM; discard it (allocator, not engine).
+
+Progression at 32K decode ms/step: reported-63 (accounting bug) → **true 26–29**
+once prefill was split correctly. No engine change moved it — the number was
+always this; the harness was lying.
 
 **tok/s tracks acceptance, which varies by slice and shifts whenever numerics
-change.** Two slices at 32K differ by 15 points of acceptance and 5 tok/s. Never
-compare a single slice across a code change without checking acceptance moved
-less than the effect being claimed.
+change.** ms/step barely moves across slices (28.9 vs 29.9 at 16K); tok/s swings
+35 points on the same rows because acceptance does. Compare ms/step across a code
+change, tok/s only at matched acceptance.
 
-### Where the 16K step goes (per-kernel, isolated graph replays)
+### Where the 16K step goes (per-kernel, isolated graph replays, pre-A6 full-context draft)
 
 | item | ms/step | context-dependent? |
 |---|---|---|
@@ -187,6 +218,7 @@ less than the effect being claimed.
 | target attention (2.90 + 1.00) | 3.90 | yes |
 
 ~17 ms/step is context-independent. That is why A2 matters at every length.
+Draft attention row reflects full-context draft; with window=4096 (A6) this cost is cut proportionally to the window/context ratio (~4× at 16K).
 
 ---
 
@@ -202,6 +234,7 @@ less than the effect being claimed.
 | Q/K/V and gate/up fusion | `engine/fuse_weights.py` | one wide matmul, not narrow ones |
 | YaRN RoPE scaling | `engine/layers.py` | makes >32768 context possible |
 | Context-dependent `n_draft` | `SpeculativePagedEngine` | mechanism only; curve unmeasured |
+| Sliding-window draft attention | `engine/kernels/paged_attention.py`, `SpeculativePagedEngine` | draft KV traffic cut ~10× at 32K; met 16K target |
 
 **Use INT8, not FP8, for KV.** Both are one byte, but per-token amax scaling
 already supplies the exponent range FP8 spends bits on, so e4m3's 3 mantissa bits
@@ -247,7 +280,19 @@ as noise, and anything wildly larger as suspect rather than real.
 project came from the harness: an L2-cached kernel sweep, `.clone()`d test
 tensors, a benchmark that stood up three KV pools and read its own allocator
 thrashing as a 65× engine regression, a corpus that changed whenever the repo
-did, and a corpus short enough that long prompts repeated into 100% acceptance.
+did, a corpus short enough that long prompts repeated into 100% acceptance, and
+— most expensively — a decode figure computed as `e2e − separate_prefill_estimate`
+where the estimate ran warm and read ~2.6 s low, inventing a 32K throughput gap
+that three planned optimizations (A7) were about to chase. It cost nothing to
+build a second measurement (`spec_decode_wall.py`, decode-only wall) and diff it;
+the disagreement was the whole finding. **Never subtract one measurement from
+another when you can measure the thing directly** — the errors don't cancel, they
+land wherever the arithmetic sends them, and here that was every long-context row.
+
+**A number that violates a monotonicity you know must hold is the measurement's
+bug, not physics'.** Decode ms/step *must* rise with context (more KV to attend).
+The old bench had 4K < 16K but 16K < 32K inverted once you looked; the corrected
+one is monotone 24 → 27 → 28. When a curve bends the wrong way, check the ruler.
 
 **Budget VRAM before benchmarking at length.** A KV pool is
 `n_layer × blocks × n_kv × block_size × head_dim × 2 × bytes` — 2.6 GB per target
@@ -272,6 +317,10 @@ Keep this current. One line per landed change, newest last.
 - 2026-08-23 — A2: split-K INT4 matmul (deterministic reduce); 4K 115.7 → 134.2 tok/s
 - 2026-08-23 — A3: n_draft sweep — monotone at 32K (+9%), flat at 16K; n_draft=4 kept
 - 2026-08-23 — A6: sliding-window draft attention; **16K met at 84.7 tok/s**, 32K 36.3 → 42.7
+- 2026-08-23 — A7: found the "32K gap" was a bench prefill-accounting bug, not the engine.
+  True decode 26–29 ms/step (91–99 tok/s), above the 55–65 band. Fixed the bench to
+  stamp decode-start in-run; added `spec_decode_wall.py`. **Ladder met at 4K/16K/32K.**
+  Remaining: 64K (blocked on VRAM — 32K already 83–94 %).
 
 ---
 

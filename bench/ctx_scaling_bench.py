@@ -204,22 +204,39 @@ def main() -> None:
         # Warm up so graph capture is not billed to the measured run.
         eng.run_offline([LlamaRequest(req_id=0, prompt_ids=ids, max_new_tokens=N)])
 
-        # Prefill alone, timed on the engine we already built. Standing up a
-        # second engine for this allocates another full KV pool — 2.6 GB a copy
-        # at 16K — and three copies pushed a 16 GB card into allocator
-        # thrashing that read as a 65x decode slowdown, i.e. as an engine
-        # regression rather than a harness bug.
-        prefill_ms = _time_prefill(eng.target, ids)
+        # Split prefill from decode WITHIN the measured run, by stamping the
+        # wall clock at the first decode op (the first draft step of the spec
+        # loop, which runs only after both prefills finish). A separately-timed
+        # prefill pass — the previous approach — reads ~2.6 s low at 32K because
+        # its KV blocks are already allocated and its allocator is warm, while
+        # the real prefill inside run_offline pays those costs fresh. At 32K that
+        # 2.6 s error, divided across ~76 decode steps, inflated the reported
+        # decode ms/step from a true 29 to 63 — i.e. it manufactured the entire
+        # "32K throughput gap". Measuring the run's own prefill removes it.
+        decode_start = {"t": None}
+        orig_draft_step = eng.draft._step_one_graphed
+
+        def _stamped_draft_step(*a, **k):
+            if decode_start["t"] is None:
+                torch.cuda.synchronize()
+                decode_start["t"] = time.perf_counter()
+            return orig_draft_step(*a, **k)
+
+        eng.draft._step_one_graphed = _stamped_draft_step
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         res, st = eng.run_offline([LlamaRequest(req_id=1, prompt_ids=ids, max_new_tokens=N)])
         torch.cuda.synchronize()
-        e2e = time.perf_counter() - t0
+        end = time.perf_counter()
+        eng.draft._step_one_graphed = orig_draft_step
 
+        e2e = end - t0
+        # First draft step is the true decode start; everything before it is prefill.
+        prefill_ms = (decode_start["t"] - t0) * 1000 if decode_start["t"] else 0.0
         n = len(res[1])
         peak_gb = torch.cuda.max_memory_allocated() / 1e9
-        decode_s = max(e2e - prefill_ms / 1000, 1e-6)
+        decode_s = max(end - decode_start["t"], 1e-6) if decode_start["t"] else max(e2e, 1e-6)
         tgt = _nearest_target(plen + n)
         tgt_s = f"{tgt[0]}-{tgt[1]}" if tgt else "-"
         print(f"{plen:>8}{plen + n:>9}{n_draft:>4}{slice_i:>4}{prefill_ms:>12.0f}"
