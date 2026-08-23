@@ -182,6 +182,25 @@ noise of 0.66% leaves argmax agreement at 100%, and even 10% leaves it at 78%.
 So 0.4% agreement is never "the format is too coarse" — measure the equivalent
 noise before accepting a precision explanation.
 
+**Suspect the measurement apparatus first.** Every wrong conclusion on
+2026-08-22/23 came from the harness, not the code under test: an L2-cached
+kernel sweep that mis-ranked tile configs, `.clone()`d test tensors that hid a
+stride bug, and a benchmark that stood up three KV pools and read its own
+allocator thrashing as a 65x engine regression. Before believing a dramatic
+result, price out what the *measurement* costs in memory and bandwidth.
+
+**Budget VRAM before benchmarking at length.** A KV pool is
+`n_layer × blocks × n_kv × block_size × head_dim × 2 × bytes`; at 16K that is
+2.6 GB per target engine. Anything that instantiates a second engine — timing
+prefill separately, A/B-ing two configs in one process — doubles or triples it.
+Reuse one engine and release sequences instead.
+
+**Both engine bugs were found by checking a second thing**, not by staring at
+the suspect: the int32 overflow surfaced because the *baseline* was diffed
+alongside speculative decode, and the quantization question was settled by
+injecting equivalent noise into the unquantized path. When something looks
+broken, find the comparison that discriminates between your hypotheses.
+
 ---
 
 ## Commands

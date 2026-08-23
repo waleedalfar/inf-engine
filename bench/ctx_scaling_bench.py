@@ -35,6 +35,32 @@ def _nearest_target(ctx: int):
     return TARGETS[best] if abs(best - ctx) <= best * 0.4 else None
 
 
+def _time_prefill(engine, ids: list[int]) -> float:
+    """Milliseconds for one prefill of ``ids``, reusing ``engine``'s KV pool.
+
+    Warms up once, then times a second pass, releasing the sequence each time so
+    the pool is left exactly as it was found.
+    """
+    from engine.llama_paged_engine import LlamaRequest
+
+    def once() -> float:
+        sid = engine._next_seq_id
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        engine._prefill(LlamaRequest(req_id=-99, prompt_ids=ids, max_new_tokens=1), 0.0)
+        torch.cuda.synchronize()
+        elapsed = (time.perf_counter() - t0) * 1000
+        engine._active.pop(sid, None)
+        if sid in engine.cache.seq_lens:
+            engine.cache.free_sequence(sid)
+        engine._generated.pop(sid, None)
+        engine.completed = [r for r in engine.completed if r.req_id != -99]
+        return elapsed
+
+    once()
+    return once()
+
+
 def _corpus_ids(tokenizer, need: int) -> list[int]:
     """Real prose, long enough to slice any requested prompt length from."""
     text = ""
@@ -119,19 +145,12 @@ def main() -> None:
         # Warm up so graph capture is not billed to the measured run.
         eng.run_offline([LlamaRequest(req_id=0, prompt_ids=ids, max_new_tokens=N)])
 
-        # Prefill alone: one target prefill of the same prompt.
-        pf = LlamaPagedEngine(target, n_total_blocks=n_blocks, block_size=16,
-                              eos_token=None, sampling=greedy, enable_cuda_graphs=True)
-        req_p = LlamaRequest(req_id=0, prompt_ids=ids, max_new_tokens=1)
-        pf._prefill(req_p, 0.0)
-        torch.cuda.synchronize()
-        pf2 = LlamaPagedEngine(target, n_total_blocks=n_blocks, block_size=16,
-                               eos_token=None, sampling=greedy, enable_cuda_graphs=True)
-        t0 = time.perf_counter()
-        pf2._prefill(LlamaRequest(req_id=0, prompt_ids=ids, max_new_tokens=1), 0.0)
-        torch.cuda.synchronize()
-        prefill_ms = (time.perf_counter() - t0) * 1000
-        del pf, pf2
+        # Prefill alone, timed on the engine we already built. Standing up a
+        # second engine for this allocates another full KV pool — 2.6 GB a copy
+        # at 16K — and three copies pushed a 16 GB card into allocator
+        # thrashing that read as a 65x decode slowdown, i.e. as an engine
+        # regression rather than a harness bug.
+        prefill_ms = _time_prefill(eng.target, ids)
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
