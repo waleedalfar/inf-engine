@@ -246,6 +246,123 @@ def _int4_matmul_kernel(
 
 
 @triton.jit
+def _int4_matmul_splitk_kernel(
+    A, Packed, Scale, C,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_pk, stride_pn,
+    stride_sg, stride_sn,
+    stride_ck, stride_cm, stride_cn,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    """Split-K variant of ``_int4_matmul_kernel``: partials accumulate atomically.
+
+    At decode shapes the tiled kernel is stuck between two bad options. ``Packed``
+    is (K/2, N) row-major, so a block reads BLOCK_N *bytes* per row: BLOCK_N=128
+    finally covers a whole 128-byte cache line, but leaves only N/128 blocks —
+    32 for an N=4096 projection, against 70 SMs. Smaller tiles fill the grid and
+    waste three quarters of every line. Measured cold, neither passes ~30% of
+    peak bandwidth on the N=4096 shapes.
+
+    Splitting the K axis breaks the tie: each (m, n) tile is computed by SPLIT_K
+    programs covering disjoint K slices, so BLOCK_N can be wide *and* the grid
+    full.
+
+    Partials go to a ``(SPLIT_K, M, N)`` buffer and are summed by a separate
+    kernel in fixed order, **not** with ``tl.atomic_add``. Atomics would be
+    cheaper, but their accumulation order is unspecified and float addition is
+    not associative, so identical inputs could yield different logits run to run.
+    This engine's correctness gate is token-identical greedy output, so a
+    nondeterministic matmul would make it flaky — and flaky in the same shape as
+    the silent bugs it exists to catch.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    # int64 rows: offs_m * stride_cm reaches M * vocab_size, past int32 at
+    # M >= ~14134 for a 151936 vocab. See _int4_matmul_kernel.
+    offs_m    = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+    offs_n    = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_half = tl.arange(0, GROUP_SIZE // 2)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # This program owns groups pid_k, pid_k + SPLIT_K, pid_k + 2*SPLIT_K, ...
+    for k0 in range(pid_k * GROUP_SIZE, K, SPLIT_K * GROUP_SIZE):
+        k_even = k0 + offs_half * 2
+        k_odd  = k_even + 1
+
+        a_even = tl.load(
+            A + offs_m[:, None] * stride_am + k_even[None, :] * stride_ak,
+            mask=(offs_m[:, None] < M) & (k_even[None, :] < K), other=0.0,
+        )
+        a_odd = tl.load(
+            A + offs_m[:, None] * stride_am + k_odd[None, :] * stride_ak,
+            mask=(offs_m[:, None] < M) & (k_odd[None, :] < K), other=0.0,
+        )
+
+        pk = k0 // 2 + offs_half
+        p = tl.load(
+            Packed + pk[:, None] * stride_pk + offs_n[None, :] * stride_pn,
+            mask=(pk[:, None] < K // 2) & (offs_n[None, :] < N), other=0,
+        ).to(tl.int8)
+
+        high  = p >> 4
+        low_u = (p & 0x0F).to(tl.int8)
+        low   = (low_u << 4).to(tl.int8) >> 4
+
+        partial = (
+            tl.dot(a_even, high.to(tl.bfloat16), allow_tf32=False)
+            + tl.dot(a_odd, low.to(tl.bfloat16), allow_tf32=False)
+        )
+        s = tl.load(
+            Scale + (k0 // GROUP_SIZE) * stride_sg + offs_n * stride_sn,
+            mask=offs_n < N, other=0.0,
+        )
+        acc = acc + partial * s[None, :]
+
+    tl.store(
+        C + pid_k * stride_ck + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+@triton.jit
+def _reduce_splitk_kernel(
+    Partials, Out,
+    M, N,
+    stride_pk, stride_pm, stride_pn,
+    stride_om, stride_on,
+    SPLIT_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Sum the SPLIT_K partials in fixed order and cast to the output dtype.
+
+    Fixed order is the point: this is what makes the split-K path bit-reproducible
+    where atomics would not be.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < N
+    m64 = tl.full((), pid_m, tl.int64)
+
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for k in range(SPLIT_K):
+        acc += tl.load(
+            Partials + k * stride_pk + m64 * stride_pm + offs_n * stride_pn,
+            mask=n_mask, other=0.0,
+        )
+    tl.store(Out + m64 * stride_om + offs_n * stride_on,
+             acc.to(Out.dtype.element_ty), mask=n_mask)
+
+
+@triton.jit
 def _int4_gemv_kernel(
     A, Packed, Scale, C,
     N, K,
@@ -337,6 +454,62 @@ def _decode_launch_config(n: int, k: int) -> tuple[int, int, int]:
     return 128, 4, 3             # lm_head (N=151936): ~630 GB/s
 
 
+def _splitk_config(n: int, k: int, m: int) -> tuple[int, int, int, int] | None:
+    """(BLOCK_N, SPLIT_K, num_warps, num_stages) for split-K, or None to stay tiled.
+
+    Read off a cold sweep over the post-fusion Qwen3-8B shapes at M=1 and M=5
+    (see the commit that introduced this). Speedups over the tiled kernel:
+
+        shape     K      N       M=1    M=5
+        qkv       4096   6144    1.33x  1.30x
+        o         4096   4096    1.56x  9.32x
+        gate_up   4096   44032   1.06x  1.10x
+        down      22016  4096    1.91x  2.08x
+        lm_head   4096   151936  0.98x  0.94x   <- tiled wins, stay tiled
+
+    The 9.32x on `o` at M=5 is the tiled kernel's pathological case, not split-K
+    being extraordinary: it manages 40 GB/s there against 228 GB/s at M=1.
+    """
+    if m > 16:
+        return None          # prefill has plenty of row parallelism already
+    if n > 65536:
+        return None          # lm_head: the grid is wide enough without splitting
+    if k >= 16384:
+        return 256, 8, 8, 2  # down: long K is exactly what split-K is for
+    if n <= 8192:
+        return 128, 8, 8, 2  # qkv, o: too few N-blocks to fill the GPU alone
+    return 128, 4, 8, 2      # gate_up
+
+
+def _int4_matmul_splitk(a, packed, scale, group_size, cfg):
+    """Split-K path: per-slice partials, then a fixed-order reduction."""
+    m, k = a.shape
+    _, n = packed.shape
+    block_n, split_k, warps, stages = cfg
+
+    partials = torch.empty((split_k, m, n), device=a.device, dtype=torch.float32)
+    c = torch.empty((m, n), device=a.device, dtype=a.dtype)
+
+    _int4_matmul_splitk_kernel[(triton.cdiv(m, 16), triton.cdiv(n, block_n), split_k)](
+        a, packed, scale, partials,
+        m, n, k,
+        a.stride(0), a.stride(1),
+        packed.stride(0), packed.stride(1),
+        scale.stride(0), scale.stride(1),
+        partials.stride(0), partials.stride(1), partials.stride(2),
+        GROUP_SIZE=group_size, BLOCK_M=16, BLOCK_N=block_n, SPLIT_K=split_k,
+        num_warps=warps, num_stages=stages,
+    )
+    reduce_bn = min(1024, triton.next_power_of_2(n))
+    _reduce_splitk_kernel[(m, triton.cdiv(n, reduce_bn))](
+        partials, c, m, n,
+        partials.stride(0), partials.stride(1), partials.stride(2),
+        c.stride(0), c.stride(1),
+        SPLIT_K=split_k, BLOCK_N=reduce_bn, num_warps=4,
+    )
+    return c
+
+
 def int4_matmul(
     a: torch.Tensor,
     packed: torch.Tensor,
@@ -364,6 +537,11 @@ def int4_matmul(
     assert group_size == 128, f"fused INT4 kernel requires group_size=128, got {group_size}"
     m, k = a.shape
     _, n = packed.shape
+
+    cfg = _splitk_config(n, k, m)
+    if cfg is not None:
+        return _int4_matmul_splitk(a, packed, scale, group_size, cfg)
+
     c = torch.empty((m, n), device=a.device, dtype=a.dtype)
     block_n, num_warps, num_stages = _decode_launch_config(n, k)
     grid = (triton.cdiv(m, 16), triton.cdiv(n, block_n))
