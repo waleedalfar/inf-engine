@@ -313,15 +313,10 @@ class PagedLlamaKVCache:
                   off = wrt_start - blk_start     # offset inside block
                   n_t = wrt_end - wrt_start
                   src = wrt_start - base           # index into k_new[i]
-                  kw = k_new[i, :, src : src + n_t, :]
-                  vw = v_new[i, :, src : src + n_t, :]
-                  if self.quantized:
-                      kw, ks = self._quantize(kw)
-                      vw, vs = self._quantize(vw)
-                      self.k_scale[local_layer, phys[b_idx], :, off : off + n_t] = ks
-                      self.v_scale[local_layer, phys[b_idx], :, off : off + n_t] = vs
-                  self.k_pool[local_layer, phys[b_idx], :, off : off + n_t, :] = kw
-                  self.v_pool[local_layer, phys[b_idx], :, off : off + n_t, :] = vw
+                  self.k_pool[local_layer, phys[b_idx], :, off : off + n_t, :] = \
+                      k_new[i, :, src : src + n_t, :]
+                  self.v_pool[local_layer, phys[b_idx], :, off : off + n_t, :] = \
+                      v_new[i, :, src : src + n_t, :]
 
         # Advance seq_lens once per full forward — after the final layer this
         # cache owns (not necessarily config.n_layer - 1: a non-last pipeline
@@ -508,14 +503,6 @@ class PagedLlamaKVCache:
         """Undo ``_quantize`` for the gather path, which reads bf16."""
         return (x.to(torch.float32) * scale.unsqueeze(-1)).to(self.dtype)
 
-    def _read(self, local_layer: int, phys: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """One physical block's K/V in the model dtype, dequantizing if needed."""
-        k = self.k_pool[local_layer, phys]
-        v = self.v_pool[local_layer, phys]
-        if not self.quantized:
-            return k, v
-        return (self._dequantize(k, self.k_scale[local_layer, phys]),
-                self._dequantize(v, self.v_scale[local_layer, phys]))
 
     def paged_attend(
         self,
