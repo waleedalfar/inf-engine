@@ -37,7 +37,9 @@ class LlamaModel:
         # Shape: (n_ctx, head_dim) each.  Stored as float32 for precision;
         # cast to weights dtype inside forward to stay on the hot path.
         cos, sin = precompute_rope_freqs(
-            config.head_dim, config.n_ctx, config.rope_theta, device
+            config.head_dim, config.n_ctx, config.rope_theta, device,
+            rope_scaling_factor=config.rope_scaling_factor,
+            rope_original_n_ctx=config.rope_original_n_ctx,
         )
         self.rope_cos = cos  # (n_ctx, head_dim)
         self.rope_sin = sin  # (n_ctx, head_dim)

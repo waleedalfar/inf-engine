@@ -165,7 +165,9 @@ class LlamaMoEOffloadModel:
 
         device = str(vram_weights.embed_tokens.device)
         cos, sin = precompute_rope_freqs(
-            config.head_dim, config.n_ctx, config.rope_theta, device
+            config.head_dim, config.n_ctx, config.rope_theta, device,
+            rope_scaling_factor=config.rope_scaling_factor,
+            rope_original_n_ctx=config.rope_original_n_ctx,
         )
         self.rope_cos = cos
         self.rope_sin = sin

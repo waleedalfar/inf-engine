@@ -5,6 +5,8 @@ Pure tensor functions (not nn.Module) so forward-pass code reads as explicit mat
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from engine.kernels.rms_norm import MAX_FUSED_COLS, triton_rms_norm
@@ -65,11 +67,70 @@ def linear(x: torch.Tensor, weight) -> torch.Tensor:
 # Rotary Positional Embeddings (RoPE)
 # ---------------------------------------------------------------------------
 
+def _yarn_inv_freq(
+    head_dim: int,
+    theta: float,
+    factor: float,
+    original_max_seq: int,
+    device: str,
+    beta_fast: float = 32.0,
+    beta_slow: float = 1.0,
+) -> tuple[torch.Tensor, float]:
+    """YaRN "NTK-by-parts" frequencies for extending context beyond training length.
+
+    Plain position interpolation (dividing every frequency by ``factor``) damages
+    the high-frequency dimensions the model uses for local ordering. YaRN splits
+    the spectrum instead: dimensions whose wavelength is short relative to the
+    original window are left alone (extrapolated), dimensions whose wavelength
+    exceeds it are interpolated, and a linear ramp blends the band between. The
+    ``mscale`` factor compensates the attention-entropy change that stretching
+    the positions introduces.
+
+    Args:
+        head_dim:         Rotary dimension.
+        theta:            RoPE base frequency.
+        factor:           Context extension ratio (target / original).
+        original_max_seq: Context length the model was trained for.
+        device:           Device for the returned tensor.
+        beta_fast:        Rotation count above which dimensions are extrapolated.
+        beta_slow:        Rotation count below which dimensions are interpolated.
+
+    Returns:
+        ``(inv_freq, mscale)`` — frequencies of shape (head_dim/2,) and the
+        scalar to multiply the cos/sin tables by.
+    """
+    pos_freqs = theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim)
+    inv_extrapolation = 1.0 / pos_freqs
+    inv_interpolation = 1.0 / (factor * pos_freqs)
+
+    def corrective_dim(rotations: float) -> float:
+        return (head_dim * math.log(original_max_seq / (rotations * 2 * math.pi))) / (
+            2 * math.log(theta)
+        )
+
+    low = max(math.floor(corrective_dim(beta_fast)), 0)
+    high = min(math.ceil(corrective_dim(beta_slow)), head_dim - 1)
+
+    # 0 in the interpolate-only band, 1 in the extrapolate-only band, linear between.
+    ramp = (torch.arange(head_dim // 2, device=device, dtype=torch.float32) - low)
+    ramp = (ramp / max(high - low, 1e-3)).clamp(0.0, 1.0)
+    extrapolation_weight = 1.0 - ramp
+
+    inv_freq = (
+        inv_interpolation * (1.0 - extrapolation_weight)
+        + inv_extrapolation * extrapolation_weight
+    )
+    mscale = 0.1 * math.log(factor) + 1.0
+    return inv_freq, mscale
+
+
 def precompute_rope_freqs(
     head_dim: int,
     max_seq: int,
     theta: float = 500_000.0,
     device: str = "cpu",
+    rope_scaling_factor: float = 1.0,
+    rope_original_n_ctx: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build the cosine/sine tables for RoPE up to ``max_seq`` positions.
 
@@ -77,16 +138,34 @@ def precompute_rope_freqs(
     head_dim/2 pairs, then concatenated to produce full-head_dim cos/sin
     tables so the apply step is a simple pointwise multiply.
 
+    Args:
+        head_dim:            Rotary dimension.
+        max_seq:             Positions to tabulate.
+        theta:               RoPE base frequency.
+        device:              Device for the returned tables.
+        rope_scaling_factor: YaRN extension ratio. 1.0 (default) disables
+                             scaling and reproduces the original tables exactly.
+        rope_original_n_ctx: Context length the model was trained for; required
+                             when ``rope_scaling_factor > 1``.
+
     Returns:
         cos, sin — each shape (max_seq, head_dim)
     """
-    inv_freq = 1.0 / (
-        theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim)
-    )                                                              # (head_dim/2,)
+    if rope_scaling_factor > 1.0:
+        if rope_original_n_ctx is None:
+            raise ValueError("rope_scaling_factor > 1 requires rope_original_n_ctx")
+        inv_freq, mscale = _yarn_inv_freq(
+            head_dim, theta, rope_scaling_factor, rope_original_n_ctx, device
+        )
+    else:
+        inv_freq = 1.0 / (
+            theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim)
+        )                                                          # (head_dim/2,)
+        mscale = 1.0
     positions = torch.arange(max_seq, device=device).float()      # (max_seq,)
     angles = torch.outer(positions, inv_freq)                     # (max_seq, head_dim/2)
-    cos = torch.cat([angles.cos(), angles.cos()], dim=-1)         # (max_seq, head_dim)
-    sin = torch.cat([angles.sin(), angles.sin()], dim=-1)         # (max_seq, head_dim)
+    cos = torch.cat([angles.cos(), angles.cos()], dim=-1) * mscale  # (max_seq, head_dim)
+    sin = torch.cat([angles.sin(), angles.sin()], dim=-1) * mscale  # (max_seq, head_dim)
     return cos, sin
 
 

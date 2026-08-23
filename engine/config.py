@@ -40,6 +40,13 @@ class LlamaConfig:
     n_kv_heads: int
     intermediate_size: int
     rope_theta: float = 500_000.0
+    rope_scaling_factor: float = 1.0
+    """YaRN context-extension ratio. 1.0 means no scaling. Set >1 together with
+    a larger ``n_ctx`` to run past the length the model was trained for — Qwen3
+    is trained to 32768 and officially extends to 131072 with YaRN factor 4."""
+    rope_original_n_ctx: int | None = None
+    """Length the model was trained for. Required when ``rope_scaling_factor``
+    exceeds 1; the YaRN frequency split is defined relative to it."""
     norm_eps: float = 1e-5
     tie_word_embeddings: bool = False
     qk_norm: bool = False
