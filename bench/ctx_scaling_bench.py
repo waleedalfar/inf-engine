@@ -208,6 +208,10 @@ def main() -> None:
         if peak_gb > 0.80 * total_gb:
             print(f"{'':>8}  ^ peak is {peak_gb / total_gb:.0%} of the {total_gb:.1f} GB card — "
                   "timings past ~80% are allocator thrash, not engine cost")
+        if st.acceptance_rate > 0.95:
+            print(f"{'':>8}  ^ acceptance {st.acceptance_rate:.0%} is implausibly high — the "
+                  "prompt is probably repeating corpus the draft has already seen. "
+                  "tok/s is inflated; compare ms/step instead")
 
         del eng
         torch.cuda.empty_cache()
