@@ -5,12 +5,12 @@
 Reach this ladder on a single RTX 5070 Ti. Do not descope it, do not substitute
 an easier target, and do not stop at the rows that already pass.
 
-| context | committed tok/s | measured | status |
+| context | committed tok/s | measured (2 slices) | status |
 |---|---|---|---|
-| ~4K  | **90–120+** | 118.8 | ✅ met |
-| ~16K | **80–90**   | 65.3  | ❌ missing by 18% |
-| ~32K | **55–65**   | —     | ⛔ not measurable (VRAM 85%) |
-| ~64K | **40–42**   | —     | ⛔ not attempted (needs A1) |
+| ~4K  | **90–120+** | 134.2 / 125.3 | ✅ **above band** |
+| ~16K | **80–90**   | 73.4 / 66.8   | ❌ −10 to −17% |
+| ~32K | **55–65**   | 35.4 / 40.1   | ❌ −27 to −36% |
+| ~64K | **40–42**   | —             | ⛔ not attempted |
 
 Qwen3-8B INT4 target + Qwen3-0.6B draft, INT8 draft KV, n_draft=4.
 16 GB VRAM, 896 GB/s.
@@ -38,28 +38,40 @@ flattering single sample cannot be reported as the result.
 
 ## Phase A — reach the ladder
 
-### A1. INT8 target KV + quality gate — NEXT
+### A1. INT8 target KV + quality gate — ✅ DONE
 Target KV is 4.6 GB bf16 at 30K; INT8 halves it. This is a **prerequisite for
 measuring 32K at all** (currently 85% of VRAM, where timings are allocator
 pressure) and for 64K fitting. Mechanism is built (`kv_dtype=torch.int8`, kernel
 reads it natively); what is missing is evidence, because target-side quantization
 changes the model's own output distribution — unlike draft-side, which is free.
 
-Gate: perplexity within ~2% of bf16, plus greedy divergence point and top-1
-agreement over teacher-forced positions. Divergence inside the first few tokens
-means a bug, not quantization error.
+**Result (`bench/kv_quality_gate.py`, 8192 ctx, 4096-token ppl window):**
+perplexity ratio 0.9981 (tolerance 1.02), top-1 agreement 97.58% (floor 95%),
+greedy diverges at token 27 of 200, peak 7.01 → 6.34 GB. **PASS.**
 
-### A2. Split-K for `_int4_matmul_kernel`
-9.15 ms/step at 16K and **context-independent**, so it taxes every row including
-the 4K one that already passes — 59.3% of the target verify replay. Candidate:
-`BLOCK_N=128` for full cache lines plus K-splits for a full grid. Needs fp32
-atomics or a partials buffer, so budget an extra launch against the gain.
+Delivered what it was for: 32K peak went 14.5 → 12.2 GB and became measurable.
+It did not close throughput gaps — it was a memory fix, not a compute one.
 
-### A3. `n_draft` schedule
-Mechanism accepts a callable `(context_len) -> int`; the curve has not been
-measured. Every draft step pays attention cost proportional to KV history while
-its marginal yield (`p**k`) shrinks, so the optimum should fall with length.
-Sweep `--n-draft 2 3 4 6` per context and read it off.
+### A2. Split-K for `_int4_matmul_kernel` — ✅ DONE
+Cold: **2.03× on the model's matmuls at M=5**, 1.37× at M=1. `lm_head` stays
+tiled (0.94×). Partials reduce in **fixed order, not atomics** — atomic ordering
+is unspecified and float addition is not associative, which would make the
+token-identical greedy gate flaky.
+
+**End-to-end: −3.5 ms/step at 4K (acceptance matched within 0.5 points), −4.35 ms
+at 16K slice 1, ~0 at 32K.** The saving is a fixed cost, so its share shrinks as
+attention grows — it moved 4K above its band and did nothing measurable at 32K.
+
+⚠️ **Split-K changes accumulation order, so generated text differs from the tiled
+path.** Acceptance moved 72.9% → 81.0% on the *same* 16K prompt slice. tok/s is
+therefore not directly comparable across a numerics change; compare at matched
+acceptance or use isolated kernel timings.
+
+### A3. `n_draft` schedule — IN PROGRESS
+Now the main lever. A1 and A2 both addressed costs that are flat in context;
+the draft is **77% of per-step KV traffic** and at 32K each of ~3.5 draft
+forwards per step attends over 32k tokens, so this is the only remaining lever
+that scales *with* context. Sweeping `--n-draft 2 3 4 6` at 16K and 32K.
 
 ### A4. 64K enablement
 YaRN is implemented. Set `rope_scaling_factor=4`, `rope_original_n_ctx=32768`,
@@ -115,16 +127,21 @@ Deferred until the ladder is met. Existing scaffolding: `engine/distributed/`
 `bench/ctx_scaling_bench.py`, corpus `d122f3bde4eb`, 200 generated tokens,
 INT8 draft KV, n_draft=4, single slice:
 
-| end ctx | ms/step | decode tok/s | accept | tok/step | peak GB | guard fired |
-|---|---|---|---|---|---|---|
-| 4,296  | 30.60 | 118.8 | 84.2% | 3.62 | 8.3  | — |
-| 16,584 | 51.03 | 65.3  | 80.2% | 3.30 | 11.0 | — |
-| 24,776 | 77.82 | 59.8  | 96.3% | 4.63 | 12.7 | acceptance |
-| 32,200 | 76.89 | 33.3  | 65.9% | 2.54 | 14.5 | VRAM 85% |
+Latest: A2 (split-K) + A1 (both KVs INT8), 2 slices, n_draft=4:
 
-**Rows with a guard fired are not results.** 24K's acceptance is unrepresentative
-(that offset is deep in the repo's Python source, which the draft predicts
-unusually well); 32K's timing reflects allocator pressure.
+| end ctx | ms/step | decode tok/s | accept | tok/step | peak GB |
+|---|---|---|---|---|---|
+| 4,296  | 24.83 / 24.56 | 134.2 / 125.3 | 80.3 / 76.6% | 3.32 / 3.06 | 7.9 |
+| 16,584 | 46.99 / 38.89 | 73.4 / 66.8   | 81.0 / 66.5% | 3.43 / 2.57 | 9.7 |
+| 32,200 | 72.34 / 86.10 | 35.4 / 40.1   | 66.1 / 81.0% | 2.55 / 3.43 | 12.0 |
+
+Progression at 16K: 65.3 (bf16 KV) → 63.4–63.6 (A1) → 66.8–73.4 (A2).
+At 32K: unmeasurable → 33.3–39.5 (A1) → 35.4–40.1 (A2).
+
+**tok/s tracks acceptance, which varies by slice and shifts whenever numerics
+change.** Two slices at 32K differ by 15 points of acceptance and 5 tok/s. Never
+compare a single slice across a code change without checking acceptance moved
+less than the effect being claimed.
 
 ### Where the 16K step goes (per-kernel, isolated graph replays)
 
@@ -209,6 +226,8 @@ Keep this current. One line per landed change, newest last.
 - 2026-08-23 — YaRN RoPE scaling (enables >32768)
 - 2026-08-23 — Benchmark: peak-VRAM + acceptance guards, pinned 168k corpus, `--slices`
 - 2026-08-23 — Cleared stale docs; CLAUDE.md rebuilt around measured results
+- 2026-08-23 — A1: target-KV INT8 passes quality gate; 32K peak 14.5 → 12.2 GB, now measurable
+- 2026-08-23 — A2: split-K INT4 matmul (deterministic reduce); 4K 115.7 → 134.2 tok/s
 
 ---
 
