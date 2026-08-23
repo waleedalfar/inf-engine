@@ -65,7 +65,11 @@ text ──► QwenTokenizer / GPT2Tokenizer ──► input_ids (B, T)
 | File | Responsibility |
 |---|---|
 | `engine/llama_weights.py` | `LlamaWeights` — HF safetensors, sharded load, `layer(i)`, `expert_weights(i, eid)` |
-| `engine/llama_attention.py` | GQA attention + RoPE + optional QK-norm (Qwen3) |
+| `engine/llama_attention.py` | GQA attention + RoPE + optional QK-norm (Qwen3); prefers a cache's `fused_attend` |
+| `engine/kernels/paged_attention.py` | Paged flash-decoding: GQA-native, split-KV, INT8/FP8 KV, offset-causal |
+| `engine/kernels/rms_norm.py` | Fused RMSNorm — one launch instead of the six the torch expression compiles to |
+| `engine/kernels/rope.py` | Fused RoPE — one launch per tensor instead of ~six |
+| `engine/fuse_weights.py` | Concatenates Q/K/V and gate/up into single wide projections at load time |
 | `engine/llama_mlp.py` | `swiglu_mlp` — dense SwiGLU (gate×silu×up→down) |
 | `engine/llama_moe.py` | `moe_mlp` — router + top-K expert dispatch + shared expert (Qwen3-MoE) |
 | `engine/llama_block.py` | Pre-norm block: attention sub-layer + MLP sub-layer (dense or MoE) |

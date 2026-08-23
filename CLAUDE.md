@@ -3,217 +3,161 @@
 ## THE COMMITTED MILESTONE
 
 This is the plan. Do not descope it, do not substitute an easier target, and do
-not stop at the first number in the table.
+not stop at the first row.
 
-| context | committed tok/s |
-|---|---|
-| ~4K  | **90–120+** |
-| ~16K | **80–90** |
-| ~32K | **55–65** |
-| ~64K | **40–42** |
-
-Model pair: Qwen3-8B INT4 (target) + Qwen3-0.6B (draft), n_draft tuned per
-context. Hardware: RTX 5070 Ti, 16 GB, 896 GB/s.
-
-**All four rows are committed, not just 4K.** 4K is the only one reachable with
-PyTorch SDPA; the rest require the custom kernel described below. It is accepted
-that the kernel's final efficiency is not knowable in advance. That uncertainty
-is not a reason to renegotiate the targets — it is a reason to build the kernel
-and measure. Give it the full attempt.
-
----
-
-## Progress
-
-| date | change | 4296 ctx | 8392 ctx |
+| context | committed tok/s | measured | status |
 |---|---|---|---|
-| baseline | SDPA gather + expand | 16.7 | 10.6 |
-| 2026-08-22 | paged flash-decoding kernel | 71.7 | 53.3 |
-| 2026-08-22 | + INT8 draft KV | **82.2** | **73.9** |
+| ~4K  | **90–120+** | 118.8 | **met** |
+| ~16K | **80–90**   | 65.3  | **missing by 18%** |
+| ~32K | **55–65**   | not yet measurable | VRAM-bound |
+| ~64K | **40–42**   | not yet attempted | needs INT8 target KV |
 
-(decode tok/s, 200 generated; acceptance 63–67% on these prompts, so at the
-3.16 tok/step a well-matched prompt gives, 4296 is ≈100.)
+Model pair: Qwen3-8B INT4 target + Qwen3-0.6B draft, INT8 draft KV, n_draft=4.
+Hardware: RTX 5070 Ti, 16 GB, 896 GB/s.
 
-Done: the custom kernel (item 3), INT8 KV (item 4). The kernel subsumed items 1
-and 2 — it reads the block table directly, so there is no gather to pad and no
-expansion to avoid; splits past the true length exit immediately.
-
-Remaining: context-dependent `n_draft` (item 5), 64K enablement (item 6), and
-the INT4 matmul, which is now ~69% of the target verify step and is the largest
-context-independent cost.
-
-## Why the old numbers don't transfer
-
-Everything before 2026-08-22 optimized a **239-token** context (39-token prompt,
-200 generated). At that length the step is dominated by weight streaming, which
-is constant in context length. That work is done and it got short-context decode
-to ~104 tok/s.
-
-It does not generalize. Measured throughput vs. context (same model pair, 200
-generated tokens):
-
-| end ctx | tok/s | ms/step |
-|---|---|---|
-| 239 | 84.6 | 29.6 |
-| 400 | 101.9 | 38.5 |
-| 700 | 54.7 | 45.1 |
-| 1200 | 37.0 | 62.1 |
-| 2200 | 27.8 | 97.1 |
-| 4200 | 16.7 | 161.6 |
-
-**Treat any tok/s figure in this repo without a stated context length as
-short-context and therefore not evidence about this goal.**
+**All four rows are committed, not just the ones that are close.**
 
 ---
 
-## The two facts that drive the design
+## REPORT MEASURED NUMBERS ONLY
 
-### 1. The draft model is 77% of per-step KV traffic
+Do not divide a measured `ms/step` by an assumed tokens-per-step to produce a
+"normalized" throughput figure. That number was never measured by anything, and
+in this project it landed closer to target than the real one every single time
+— which is what motivated reasoning looks like from the inside.
 
-Qwen3-0.6B has the **same** 8 KV heads × 128 head_dim as the 8B target, and 28
-vs 36 layers — 112 KiB per context-token vs the target's 144 KiB. But it runs
-**4.35× per step** (n_draft draft steps + the bonus-sync forward).
+If a comparison needs a number, **measure it**. `--slices N` exists precisely so
+a flattering single sample cannot be reported as the result.
 
-At long context the "small" draft model costs over 3× what the 8B target costs.
-Any long-context optimization that ignores the draft is optimizing 23% of the
-problem.
-
-### 2. SDPA is ~25× off the bandwidth floor at these shapes
-
-At 4200 ctx (8192 bucket), attention + K/V expansion costs **33 ms**. The pure
-bandwidth floor for that attention is **~1.3 ms**:
-
-| factor | cause | fix |
-|---|---|---|
-| ~2× | bucket padding — 8192 gathered for 4200 real | finer `len_bucket` granularity |
-| ~4× | `repeat_kv` expands 8 KV heads to 32 | GQA-native attention |
-| ~3× | SDPA mem-efficient backend at `q_len=5` | **custom kernel — no SDPA path fixes this** |
-
-PyTorch's flash backend rejects arbitrary `attn_mask`; the mem-efficient backend
-accepts it but is poor at 1–5 row queries; and neither reads FP8 K/V, so KV
-quantization cannot pay off through SDPA (dequantizing to bf16 before the call
-gives back exactly the bandwidth it saved).
+The same rule covers forward-looking claims. "This should land near 45 ms/step"
+is the same error in future tense.
 
 ---
 
-## The work, in order
+## Measured results
 
-### 1-2. Bucket padding and the GQA fold — SUBSUMED by the kernel
-Both existed to work around the gather. The kernel reads the block table
-directly, so there is no contiguous gather to pad and no expansion to avoid, and
-splits past a sequence's true length exit immediately. Neither was implemented;
-neither is needed.
+`bench/ctx_scaling_bench.py`, corpus `d122f3bde4eb`, 200 generated tokens,
+INT8 draft KV, n_draft=4:
 
-### 3. Custom flash-decoding attention kernel — DONE (`engine/kernels/paged_attention.py`)
-Triton, in `engine/kernels/`. Requirements:
-- **GQA-native**: reads `n_kv` heads directly, never materializes an expansion.
-- **Split over the KV axis** (flash-decoding): a 1–5 row query cannot fill 70 SMs
-  by itself. Partition KV into chunks, run per-chunk online softmax, combine
-  with the standard log-sum-exp merge. This is what makes short queries saturate
-  the GPU and is the single most important property of the kernel.
-- **FP8 KV capable**: read FP8 K/V from HBM, dequantize in registers. Halves the
-  dominant traffic term. Must be a kernel-level feature — see above for why it
-  cannot be bolted on outside.
-- **Offset-causal masking**: query row `i` attends keys `0..start_pos+i`, plus a
-  true-length bound so bucket padding is excluded. Masking is the #1 correctness
-  risk here — see the audit skill before writing a line of it.
-- **CUDA-graph capturable**: static shapes per bucket, no host syncs.
+| end ctx | ms/step | decode tok/s | accept | tok/step | peak GB | guard fired |
+|---|---|---|---|---|---|---|
+| 4,296  | 30.60 | 118.8 | 84.2% | 3.62 | 8.3  | — |
+| 16,584 | 51.03 | 65.3  | 80.2% | 3.30 | 11.0 | — |
+| 24,776 | 77.82 | 59.8  | 96.3% | 4.63 | 12.7 | acceptance |
+| 32,200 | 76.89 | 33.3  | 65.9% | 2.54 | 14.5 | VRAM 85% |
 
-`engine/kernels/flash_attention.py` is the existing reference for the online
-softmax, but it is square-shaped, fp32, non-GQA — it is a teaching implementation,
-not a starting point to extend.
+Rows with a guard fired are **not results**. 24K's acceptance is unrepresentative
+of general text (that offset is deep in the repo's Python source, which the draft
+predicts unusually well); 32K ran at 85% of VRAM, where timing measures allocator
+pressure.
 
-### 4. 8-bit KV cache — DONE (`kv_dtype=torch.int8`)
-Per-(block, head, position) scales, read natively by the kernel. Landed on the
-draft, where it is free: the draft only proposes and accept/reject still yields
-the target's exact distribution. Acceptance was unchanged (66.7% vs 65.6%).
+### Where the 16K step goes
 
-**Use INT8, not FP8.** Both are one byte, but per-token amax scaling already
-supplies the exponent range FP8 spends bits on, so e4m3's 3 mantissa bits are
-strictly worse than INT8's effective 7.
+Profiled per-kernel on isolated graph replays:
 
-Target-side KV quantization changes the model's own distribution — still a
-separate, quality-gated decision (`--target-kv-int8` exists but is ungated).
+| item | ms/step | context-dependent? |
+|---|---|---|
+| `_int4_matmul_kernel` (target verify) | 9.15 | no |
+| draft gemv (1.59 × 4.96 calls) | 7.89 | no |
+| draft attention (1.93 × 4.96 calls) | 9.57 | yes |
+| target attention (2.90 + 1.00) | 3.90 | yes |
 
-### 5. Context-dependent `n_draft`
-Optimal `n_draft` falls as context grows, because every draft step now pays
-attention cost. At 32K, `n_draft=2` models ~10% ahead of `n_draft=4` despite
-lower tokens-per-step. Make it a function of context length, not a constant.
+~17 ms/step is context-independent. `_int4_matmul_kernel` alone is 59.3% of the
+target verify replay.
 
-### 6. 64K enablement
-`n_ctx` is **32768** for both models. 64K needs YaRN/RoPE scaling configured.
-Budget: ~9.7 GB KV (FP8 halves it) + ~5.2 GB weights against 16 GB.
+---
+
+## What is built
+
+| piece | where | effect |
+|---|---|---|
+| Paged flash-decoding attention | `engine/kernels/paged_attention.py` | 4.5–11.6× over SDPA at 4K–32K |
+| INT8/FP8 KV cache | `engine/paged_cache.py` | halves KV traffic; acceptance unchanged |
+| Chunked prefill | `LlamaPagedEngine._prefill_forward` | 30K prefill 447 s → 19.2 s |
+| Last-position-only prefill logits | `LlamaModel.forward(n_logits=)` | −9.1 GB at 30K |
+| Fused RMSNorm / RoPE | `engine/kernels/{rms_norm,rope}.py` | one launch instead of ~six |
+| Q/K/V and gate/up fusion | `engine/fuse_weights.py` | one wide matmul instead of narrow ones |
+| YaRN RoPE scaling | `engine/layers.py` | makes >32768 context possible at all |
+| Context-dependent `n_draft` | `SpeculativePagedEngine` | mechanism only; no schedule measured yet |
+
+**Use INT8, not FP8, for KV.** Both are one byte, but per-token amax scaling
+already supplies the exponent range FP8 spends bits on, so e4m3's 3 mantissa bits
+are strictly worse than INT8's effective 7.
+
+---
+
+## Remaining work, in measured-value order
+
+1. **`_int4_matmul_kernel`** — 9.15 ms/step at 16K and context-independent, so it
+   taxes every row including 4K. Split-K is the candidate: `BLOCK_N=128` for full
+   cache lines plus K-splits for a full grid. Needs fp32 atomics or a partials
+   buffer, so budget an extra kernel launch against the gain.
+2. **INT8 target KV** — halves the target's 4.6 GB at 30K. This is what makes 32K
+   measurable and 64K possible, so it is now a prerequisite rather than an
+   optimization. Changes the model's own distribution, so it needs a quality gate
+   (perplexity + greedy divergence vs bf16) before use.
+3. **`n_draft` schedule** — the mechanism accepts a callable; the curve has not
+   been measured. Sweep with `--n-draft 2 3 4 6` per context.
+4. **64K** — YaRN is in. Set `rope_scaling_factor=4`, `rope_original_n_ctx=32768`,
+   raise `n_ctx`. VRAM is the open question.
 
 ---
 
 ## Non-negotiable practices
 
-**Every performance claim states its context length.** A number without one is
-not a result.
+**Every performance claim states its context length *and* its acceptance rate.**
+tok/s is proportional to acceptance, which varies with prompt content — 80.2% on
+prose, 96.3% on this repo's Python source. A number without both is not a result.
 
-**A/B in a single session.** Absolute throughput drifts ~15% between sessions;
-only back-to-back comparisons are evidence.
+**A/B in a single session.** Absolute throughput drifts ~15% between sessions.
 
-**Benchmarks do not prove correctness.** `bench/paged_spec_bench` never inspects
+**Benchmarks do not prove correctness.** `ctx_scaling_bench` never inspects
 generated text. A KV-corruption bug once survived an entire optimization run at a
-healthy-looking 77% accept rate. After any change to attention, the KV cache, or
-graph capture: diff greedy speculative output against greedy baseline on a **real**
-model over >50 tokens. Greedy spec must be **token-identical** to greedy decode.
-The mini-model tests generate too few tokens to cross a `len_bucket` boundary.
+healthy-looking 77% acceptance. After any change to attention, the KV cache, or
+graph capture: diff greedy speculative output against greedy baseline on a
+**real** model over >50 tokens. They must be token-identical. Check the
+single-model baseline too — an int32 overflow in the INT4 matmul was found only
+because the baseline was diffed alongside speculative decode.
 
 **Cold-cache microbenchmarks only.** Re-timing one weight tensor in a loop reads
 L2 (64 MB on GB203), not HBM. A hot sweep once predicted 1.16× and delivered ~0
-in-graph. Rotate through ≥3× L2 of distinct tensors, and cross-check against
-in-graph `torch.profiler` time before believing any win.
-
-**Verify optimized paths actually run.** Assert the activation state and a
-side effect only the new path produces — not just that output matches the
-fallback, which passes just as well when the feature is silently off.
+in-graph. Rotate through ≥3× L2 of distinct tensors.
 
 **Never pass `.clone()`d tensors to a kernel test.** Cloning makes them
-contiguous and hides every stride bug. The quantized-KV write kernel addressed V
-through K's strides — which genuinely differ in the model, since K goes through
-QK-norm and RoPE and V does not — and four rounds of isolation tests all passed
-because each cloned its inputs. Test with tensors carrying the layout the caller
-actually produces, transposes and slices included.
+contiguous and hides stride bugs. The quantized-KV write kernel addressed V
+through K's strides — which genuinely differ, since K goes through QK-norm and
+RoPE and V does not — and four rounds of isolation tests passed because each
+cloned its inputs.
 
-**Near-total output collapse is a bug, not quantization error.** Injected KV
-noise of 0.66% leaves argmax agreement at 100%, and even 10% leaves it at 78%.
-So 0.4% agreement is never "the format is too coarse" — measure the equivalent
-noise before accepting a precision explanation.
+**Near-total output collapse is a bug, not quantization error.** 0.66% injected
+KV noise leaves argmax agreement at 100%; even 10% leaves it at 78%. So 0.4%
+agreement is never "the format is too coarse".
 
-**Suspect the measurement apparatus first.** Every wrong conclusion on
-2026-08-22/23 came from the harness, not the code under test: an L2-cached
-kernel sweep that mis-ranked tile configs, `.clone()`d test tensors that hid a
-stride bug, and a benchmark that stood up three KV pools and read its own
-allocator thrashing as a 65x engine regression. Before believing a dramatic
-result, price out what the *measurement* costs in memory and bandwidth.
+**Suspect the measurement apparatus first.** Every wrong conclusion in this
+project came from the harness, not the code under test: an L2-cached kernel
+sweep, `.clone()`d test tensors, a benchmark that stood up three KV pools and
+read its own allocator thrashing as a 65× engine regression, a corpus that
+changed whenever the repo did, and a corpus short enough that long prompts
+repeated themselves into 100% acceptance.
 
 **Budget VRAM before benchmarking at length.** A KV pool is
-`n_layer × blocks × n_kv × block_size × head_dim × 2 × bytes`; at 16K that is
-2.6 GB per target engine. Anything that instantiates a second engine — timing
-prefill separately, A/B-ing two configs in one process — doubles or triples it.
-Reuse one engine and release sequences instead.
-
-**Both engine bugs were found by checking a second thing**, not by staring at
-the suspect: the int32 overflow surfaced because the *baseline* was diffed
-alongside speculative decode, and the quantization question was settled by
-injecting equivalent noise into the unquantized path. When something looks
-broken, find the comparison that discriminates between your hypotheses.
+`n_layer × blocks × n_kv × block_size × head_dim × 2 × bytes` — 2.6 GB per target
+engine at 16K. The benchmark reports peak VRAM per row and warns past 80%.
 
 ---
 
 ## Commands
 
 ```bash
-# short-context throughput (the old regime — not the goal)
+# the goal: throughput vs context length
+.venv/bin/python -m bench.ctx_scaling_bench \
+    --model-dir weights/Qwen--Qwen3-8B --draft-model-dir weights/Qwen--Qwen3-0.6B \
+    --draft-kv-int8 --lengths 4096 16384 32000 --slices 3
+
+# short-context reference (the pre-2026-08-22 regime, not the goal)
 .venv/bin/python -m bench.paged_spec_bench \
     --model-dir weights/Qwen--Qwen3-8B --draft-model-dir weights/Qwen--Qwen3-0.6B \
     --max-new-tokens 200 --n-draft 4 --skip-eager-spec
-
-# the goal: throughput vs context length
-.venv/bin/python -m bench.ctx_scaling_bench \
-    --model-dir weights/Qwen--Qwen3-8B --draft-model-dir weights/Qwen--Qwen3-0.6B
 
 .venv/bin/pytest -q
 ```

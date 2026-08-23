@@ -46,18 +46,18 @@ Packing layout: `packed[k//2, n]` encodes two int4 weights per byte (high nibble
 even row, low nibble = odd row). Decode uses arithmetic right-shift sign extension:
 `high = p >> 4`, `low = ((p & 0x0F).to(int8) << 4) >> 4`.
 
-### FlashAttention2 prefill (SDPA)
+### Paged flash-decoding attention (custom Triton kernel)
 
-`engine/llama_attention.py` dispatches attention through `F.scaled_dot_product_attention`,
-which eliminates the O(N²) score matrix: at 8K context the naive score tensor is
-`8192² × 32 heads × 2 bytes ≈ 4 GB`, versus O(N) HBM for the fused kernels.
+Decode and speculative-verify attention run through a custom Triton kernel,
+`engine/kernels/paged_attention.py`: GQA-native, split over the KV axis
+(flash-decoding), reading K/V straight from the paged block table.
 
-> **SDPA does not reach the flash backend on the masked paths.** PyTorch's flash kernel
-> rejects arbitrary `attn_mask`, so continuous batching and speculative verify land on the
-> mem-efficient backend — which is poor at 1–5 row queries and, combined with `enable_gqa`
-> being unusable there, forces K/V to be expanded 4× first. Measured ~25× off the memory
-> bandwidth floor at 4K context. This is the main obstacle to long-context throughput and is
-> being replaced by a custom flash-decoding kernel — see [CLAUDE.md](CLAUDE.md).
+PyTorch SDPA is not used on these paths because it cannot be made fast there. Its flash
+backend rejects arbitrary `attn_mask`, so any offset-causal mask lands on the
+mem-efficient backend; `enable_gqa` is unusable alongside a mask on that backend, forcing
+a 4× K/V expansion; and a 1–5 row query leaves the GPU mostly idle. Measured ~25× off the
+memory-bandwidth floor at 4K. The custom kernel measured 4.5–11.6× faster than that path
+across 4K–32K.
 
 Add `--compile` to wrap `model.forward` with `torch.compile(mode='reduce-overhead')`
 for an additional 10–30% decode speedup after a one-time ~60s compilation.
@@ -78,10 +78,20 @@ memory overhead per step regardless of batch size.
 in a single target-model forward pass. When the draft is right, you get K tokens for
 the cost of ~1. Typical acceptance rate 70–90% on coding tasks.
 
-**Measured (Qwen3-8B INT4 + Qwen3-0.6B draft, RTX 5070 Ti):** ~104 tok/s at 239-token
-context, falling to ~17 tok/s at 4200. Throughput here is strongly context-dependent, so
-every figure needs its context length attached; see [CLAUDE.md](CLAUDE.md) for the
-long-context targets and the work to reach them.
+**Measured** (Qwen3-8B INT4 target + Qwen3-0.6B draft, INT8 draft KV, RTX 5070 Ti,
+200 generated tokens, `bench/ctx_scaling_bench.py`):
+
+| end context | decode tok/s | ms/step | acceptance | peak VRAM |
+|---|---|---|---|---|
+| 4,296  | 118.8 | 30.60 | 84.2% | 8.3 GB |
+| 16,584 | 65.3  | 51.03 | 80.2% | 11.0 GB |
+
+Throughput is strongly context-dependent *and* strongly prompt-dependent — tok/s is
+proportional to the draft's acceptance rate, which varies with content. Every figure needs
+both its context length and its acceptance attached. Longer contexts are measured but not
+yet reportable: 24K's acceptance was unrepresentative of general text and 32K ran at 85% of
+VRAM, where timings reflect allocator pressure rather than engine cost. See
+[CLAUDE.md](CLAUDE.md).
 
 ### GQA-aware KV cache
 
@@ -165,7 +175,7 @@ Download weights:
 
 Run tests:
 ```bash
-./.venv/bin/pytest tests/ -v   # 165 passed, 6 skipped
+./.venv/bin/pytest tests/ -q   # 351 passed, 10 skipped
 ```
 
 ---
@@ -175,7 +185,7 @@ Run tests:
 ```
 engine/
   config.py              LlamaConfig dataclass + Qwen3 presets (0.6B–32B + MoE)
-  layers.py              rms_norm, silu, linear (INT4-dispatch), RoPE
+  layers.py              rms_norm, silu, linear (INT4-dispatch), RoPE + YaRN scaling
   llama_weights.py       sharded safetensors loader
   llama_attention.py     GQA + RoPE + optional QK-norm (Qwen3)
   llama_mlp.py           SwiGLU MLP
@@ -196,9 +206,12 @@ engine/
   agent.py               AgentLoop, Tool, AgentResult
   sampling.py            greedy / top-k / top-p
   kernels/
-    softmax.py           Triton fused softmax
-    flash_attention.py   Triton Flash-Attention (tiled online softmax, O(N) memory)
+    paged_attention.py   Paged flash-decoding: GQA-native, split-KV, INT8/FP8 KV
     quant.py             Triton INT8 W8A16 + fused INT4 W4A16 matmul kernel
+    rms_norm.py          Fused RMSNorm (one launch instead of six)
+    rope.py              Fused RoPE (one launch per tensor instead of ~six)
+    softmax.py           Triton fused softmax
+    flash_attention.py   Triton Flash-Attention (square, fp32 — teaching reference)
 
 scripts/
   download_llama.py      fetch Qwen3 checkpoints by shorthand name
@@ -236,5 +249,7 @@ server.py                multi-session HTTP server (continuous batching, NDJSON 
 | 7 | Qwen3 ChatML + agentic loop + coding assistant |
 | ✦ | Fused INT4 Triton kernel (this session) |
 | 8 | Multi-session HTTP server (continuous batching) + CUDA graphs for decode |
+| ✦ | Long-context: paged flash-decoding kernel, INT8 KV cache, chunked prefill, YaRN |
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/ROADMAP.md`](docs/ROADMAP.md) for deeper notes.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for module-level notes and
+[`CLAUDE.md`](CLAUDE.md) for the current performance goal and measurement rules.

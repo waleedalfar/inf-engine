@@ -162,8 +162,7 @@ above become kernel-internal invariants rather than call-site choices:
 This attention bug was originally masked by a chain of sampling-side fixes
 that made the symptom *look* different without curing it, and one of those
 fixes (an exponential frequency-weighted repetition penalty) became a
-*second*, independent bug once the real cause was found. Full incident
-narrative (private, not for the public repo): `docs/lessons/2026-08-20-garbage-output-and-repetition-penalty.md`.
+*second*, independent bug once the real cause was found.
 
 **The mistake, concretely:** a repetition loop (endless `)` tokens, 0% spec
 accept) was diagnosed as "the penalty isn't strong enough" and answered by
