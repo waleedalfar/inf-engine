@@ -25,6 +25,7 @@ decode — the standard correctness gate for speculative decoding (see
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import torch
@@ -54,7 +55,16 @@ class SpeculativePagedEngine:
         draft:    Fully loaded draft ``LlamaPagedEngine`` (small model).
                   Should have ``enable_cuda_graphs=True`` on CUDA for best
                   performance.
-        n_draft:  Number of draft tokens to generate per speculative step.
+        n_draft:  Draft tokens per speculative step. An int for a fixed value,
+                  or a callable ``(context_len) -> int`` to vary it with the
+                  sequence length.
+
+                  Varying it matters at long context. Every draft step now pays
+                  attention cost proportional to the KV history, so the marginal
+                  draft token gets more expensive as context grows while its
+                  marginal yield (``p**k`` for acceptance ``p``) keeps shrinking.
+                  The optimum therefore falls with length — see
+                  ``bench/ctx_scaling_bench.py`` for the sweep that pins it.
         eos_token: Token id that signals end-of-sequence.  When None, only
                   ``max_new_tokens`` is used as a stopping criterion.
     """
@@ -63,12 +73,13 @@ class SpeculativePagedEngine:
         self,
         target: LlamaPagedEngine,
         draft: LlamaPagedEngine,
-        n_draft: int = 4,
+        n_draft: int | Callable[[int], int] = 4,
         eos_token: int | None = None,
     ) -> None:
         self.target = target
         self.draft = draft
         self.n_draft = n_draft
+        self.max_n_draft = n_draft if isinstance(n_draft, int) else 16
         self.eos = eos_token
 
     # ------------------------------------------------------------------
@@ -89,6 +100,12 @@ class SpeculativePagedEngine:
             combined.n_bonus += stats.n_bonus
             combined.n_steps += stats.n_steps
         return results, combined
+
+    def _n_draft_for(self, context_len: int) -> int:
+        """Draft tokens to speculate at this context length."""
+        if callable(self.n_draft):
+            return max(1, int(self.n_draft(context_len)))
+        return self.n_draft
 
     # ------------------------------------------------------------------
     # Internal: one request
@@ -131,7 +148,7 @@ class SpeculativePagedEngine:
         # actually configured — otherwise _get_probs ignores it and rebuilding
         # a growing device tensor every step is pure waste.
         ctx = (
-            _RollingCtx(req.generated, req.max_new_tokens + self.n_draft + 2,
+            _RollingCtx(req.generated, req.max_new_tokens + self.max_n_draft + 2,
                         target.device, draft.device)
             if target.cfg.repetition_penalty != 1.0 or draft.cfg.repetition_penalty != 1.0
             else None
@@ -146,7 +163,7 @@ class SpeculativePagedEngine:
             t_ctx = ctx.target if ctx is not None else None
             d_ctx = ctx.draft if ctx is not None else None
 
-            K = min(self.n_draft, remaining - 1)
+            K = min(self._n_draft_for(target.cache.seq_lens[t_sid]), remaining - 1)
             if K <= 0:
                 # Only one token left — run a single target step and stop.
                 target.cache.ensure_slot(t_sid)

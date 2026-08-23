@@ -502,3 +502,51 @@ def test_greedy_spec_matches_standard_across_bucket_boundaries(n_draft):
         f"  standard: {std[:first_diff + 3] if first_diff is not None else std}\n"
         f"  spec:     {spec[:first_diff + 3] if first_diff is not None else spec}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Context-dependent n_draft
+# ---------------------------------------------------------------------------
+
+def test_n_draft_accepts_a_callable():
+    """n_draft may vary with context length, not just be a constant.
+
+    At long context every draft step pays attention cost proportional to the KV
+    history, so the optimal speculation depth falls as the sequence grows.
+    """
+    cfg = _mini_config()
+    target_model = _mini_model(cfg, seed=1)
+    draft_model = _mini_model(cfg, seed=2)
+    greedy = SamplingConfig(mode=SamplingMode.GREEDY)
+    t = _make_paged_engine(target_model)
+    d = _make_paged_engine(draft_model)
+
+    seen: list[int] = []
+
+    def schedule(ctx_len: int) -> int:
+        seen.append(ctx_len)
+        return 1 if ctx_len > 12 else 3
+
+    spec = SpeculativePagedEngine(t, d, n_draft=schedule, eos_token=None)
+    req = LlamaRequest(req_id=0, prompt_ids=[1, 2, 3, 4], max_new_tokens=20)
+    generated, stats = spec._generate_one(req)
+
+    assert len(generated) == 20
+    assert seen, "schedule was never consulted"
+    assert max(seen) > min(seen), "context length never advanced"
+    # Both branches of the schedule must have been taken over a 20-token run.
+    assert any(c <= 12 for c in seen) and any(c > 12 for c in seen)
+
+
+def test_callable_n_draft_matches_equivalent_constant():
+    """A schedule pinned to one value must behave exactly like that constant."""
+    cfg = _mini_config()
+    greedy = SamplingConfig(mode=SamplingMode.GREEDY)
+    outs = []
+    for n_draft in (2, lambda _ctx: 2):
+        t = _make_paged_engine(_mini_model(cfg, seed=1))
+        d = _make_paged_engine(_mini_model(cfg, seed=2))
+        spec = SpeculativePagedEngine(t, d, n_draft=n_draft, eos_token=None)
+        req = LlamaRequest(req_id=0, prompt_ids=[1, 2, 3], max_new_tokens=16)
+        outs.append(spec._generate_one(req)[0])
+    assert outs[0] == outs[1]

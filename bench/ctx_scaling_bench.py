@@ -79,7 +79,8 @@ def main() -> None:
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--draft-model-dir", required=True)
     ap.add_argument("--max-new-tokens", type=int, default=200)
-    ap.add_argument("--n-draft", type=int, default=4)
+    ap.add_argument("--n-draft", type=int, nargs="+", default=[4],
+                    help="One value, or several to sweep at each context length.")
     ap.add_argument("--lengths", type=int, nargs="+",
                     default=[256, 1024, 4096, 8192, 16384, 32768])
     ap.add_argument("--draft-kv-int8", action="store_true",
@@ -118,19 +119,19 @@ def main() -> None:
     all_ids = _corpus_ids(tokenizer, max(args.lengths) + 16)
     greedy = SamplingConfig(mode=SamplingMode.GREEDY)
 
-    print(f"\nn_draft={args.n_draft}, generating {N} tokens per point, "
+    print(f"\ngenerating {N} tokens per point, "
           f"draft KV={'int8' if d_kv else 'bf16'}, target KV={'int8' if t_kv else 'bf16'}")
-    print(f"{'prompt':>8}{'end ctx':>9}{'prefill ms':>12}{'decode ms/step':>16}"
+    print(f"{'prompt':>8}{'end ctx':>9}{'K':>4}{'prefill ms':>12}{'decode ms/step':>16}"
           f"{'decode tok/s':>14}{'e2e tok/s':>11}{'accept':>8}{'tok/step':>10}{'target':>12}")
     print("-" * 100)
 
-    for plen in args.lengths:
+    for plen, n_draft in [(p, k) for p in args.lengths for k in args.n_draft]:
         if plen + N + 64 > tcfg.n_ctx:
             print(f"{plen:>8}   skipped — exceeds n_ctx={tcfg.n_ctx} "
                   f"(needs RoPE scaling; see CLAUDE.md)")
             continue
         ids = all_ids[:plen]
-        n_blocks = (plen + N + args.n_draft + 64) // 16 + 64
+        n_blocks = (plen + N + n_draft + 64) // 16 + 64
 
         def build():
             t = LlamaPagedEngine(target, n_total_blocks=n_blocks, block_size=16,
@@ -139,7 +140,7 @@ def main() -> None:
             d = LlamaPagedEngine(draft, n_total_blocks=n_blocks, block_size=16,
                                  eos_token=None, sampling=greedy,
                                  enable_cuda_graphs=True, kv_dtype=d_kv)
-            return SpeculativePagedEngine(t, d, n_draft=args.n_draft, eos_token=None)
+            return SpeculativePagedEngine(t, d, n_draft=n_draft, eos_token=None)
 
         eng = build()
         # Warm up so graph capture is not billed to the measured run.
@@ -162,7 +163,7 @@ def main() -> None:
         decode_s = max(e2e - prefill_ms / 1000, 1e-6)
         tgt = _nearest_target(plen + n)
         tgt_s = f"{tgt[0]}-{tgt[1]}" if tgt else "-"
-        print(f"{plen:>8}{plen + n:>9}{prefill_ms:>12.0f}"
+        print(f"{plen:>8}{plen + n:>9}{n_draft:>4}{prefill_ms:>12.0f}"
               f"{decode_s / st.n_steps * 1000:>16.2f}{n / decode_s:>14.1f}"
               f"{n / e2e:>11.1f}{st.acceptance_rate:>8.1%}{st.tokens_per_step:>10.2f}{tgt_s:>12}")
 
