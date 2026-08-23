@@ -126,14 +126,31 @@ The "~38 ms unexplained" was the misattributed prefill. Benchmark fixed; see the
 milestone note above. What remains at 32K is **VRAM headroom**, not throughput.
 
 ### A4. 64K enablement — NEXT, and now the only unmet row
-YaRN is implemented. Set `rope_scaling_factor=4`, `rope_original_n_ctx=32768`,
-raise `n_ctx`. **Blocked on VRAM, and the block is real:** 32K already peaks at
-14 GB (83 %) and a fresh-run second slice hit 94 %. 64K roughly doubles KV, which
-does not fit as-is. Needs headroom first — candidates: a smaller draft KV
-footprint (draft window already bounds *reads* but the pool still allocates all
-positions; a windowed *cache* would bound the allocation), tighter block-pool
-sizing in the benchmark, or freeing the draft's out-of-window blocks. Budget VRAM
-before timing; the run will thrash before it's slow.
+YaRN is implemented and wired into the bench (`--n-ctx 131072 --rope-scaling-factor
+4 --rope-original-n-ctx 32768`). **Measured: 64K does not fit.** A probe pinned the
+GPU at 93 % VRAM (15.2 / 16.3 GB), 100 % util, grinding — it thrashes before it's
+slow, exactly as the VRAM budget predicts.
+
+**Root cause is the draft KV, not the target.** Qwen3-0.6B carries the same 8 KV
+heads × 128 head_dim as the 8B target, so at 64K its INT8 KV is ~3.65 GB (28
+layers) — nearly as large as the target's 5.0 GB (36 layers) — even though the
+draft only ever attends to its 4096-token window. That ~3.4 GB of never-read KV is
+the whole overflow: target 5.0 + draft 3.65 + weights 5.4 = 14 GB before
+activations, and prefill pushes it over.
+
+**Fix: bound the draft's KV *allocation* to window + sinks** (~0.27 GB), not just
+its reads. This is a rolling/ring-buffer paged cache and it is **not contained** —
+`PagedLlamaKVCache` maps logical position → physical block linearly
+(`block_table[p // bs]`), and that assumption is threaded through `write_kv_quant`,
+the gather in `extend()`, `build_static_buffers`, the paged-attention kernel's
+position→block indexing, and graph capture. A ring buffer breaks it everywhere.
+Plan: give the windowed draft cache a ring of `ceil((sinks+window)/bs)+margin`
+physical blocks, a position→ring-slot map, and evict-oldest-non-sink on
+`ensure_slot`; update the write/gather/kernel indexing to consult the map; keep
+the sink blocks pinned. **Full correctness gate afterward** (greedy
+token-identical vs baseline > 50 tokens) — this is a KV-cache change, the exact
+class the gate exists for. Cheaper alternative to evaluate first: INT4 draft KV
+(3.65 → 1.85 GB) may just fit and touches only the quant path, not the mapping.
 
 ### A5. Full ladder, multi-slice
 Re-measure 4K/16K/32K with `--slices 3+`, then 64K once it fits. Use a **fresh
@@ -321,6 +338,10 @@ Keep this current. One line per landed change, newest last.
   True decode 26–29 ms/step (91–99 tok/s), above the 55–65 band. Fixed the bench to
   stamp decode-start in-run; added `spec_decode_wall.py`. **Ladder met at 4K/16K/32K.**
   Remaining: 64K (blocked on VRAM — 32K already 83–94 %).
+- 2026-08-23 — A4 probe: wired YaRN into the bench (`--n-ctx/--rope-scaling-factor/
+  --rope-original-n-ctx`). 64K thrashes at 93 % VRAM; measured the block is the draft's
+  unbounded KV (~3.65 GB, never-read past its 4096 window). Fix scoped: ring-buffer
+  windowed draft cache. Not yet implemented.
 
 ---
 

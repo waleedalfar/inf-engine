@@ -136,6 +136,15 @@ def main() -> None:
     ap.add_argument("--target-kv-int8", action="store_true",
                     help="Also store the TARGET's KV in INT8. This changes the "
                          "model's own output distribution — quality-gate it.")
+    ap.add_argument("--n-ctx", type=int, default=0,
+                    help="Override both models' n_ctx (0 = use config default). "
+                         "Raise past 32768 to reach 64K; needs YaRN below.")
+    ap.add_argument("--rope-scaling-factor", type=float, default=1.0,
+                    help="YaRN extension ratio (4.0 to run a 32768-trained model "
+                         "at 131072). 1.0 disables scaling.")
+    ap.add_argument("--rope-original-n-ctx", type=int, default=0,
+                    help="Context the model was trained for; required when "
+                         "--rope-scaling-factor > 1 (32768 for Qwen3).")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -150,10 +159,22 @@ def main() -> None:
     d_kv = torch.int8 if args.draft_kv_int8 else None
     t_kv = torch.int8 if args.target_kv_int8 else None
 
+    import dataclasses
+
+    def _apply_ctx(cfg):
+        changes = {}
+        if args.n_ctx:
+            changes["n_ctx"] = args.n_ctx
+        if args.rope_scaling_factor != 1.0:
+            changes["rope_scaling_factor"] = args.rope_scaling_factor
+            changes["rope_original_n_ctx"] = args.rope_original_n_ctx or 32768
+        return dataclasses.replace(cfg, **changes) if changes else cfg
+
     tokenizer = QwenTokenizer(args.model_dir)
-    tcfg = cli.detect_config(args.model_dir)
-    dcfg = cli.detect_config(args.draft_model_dir)
-    print(f"target n_ctx={tcfg.n_ctx}  draft n_ctx={dcfg.n_ctx}")
+    tcfg = _apply_ctx(cli.detect_config(args.model_dir))
+    dcfg = _apply_ctx(cli.detect_config(args.draft_model_dir))
+    print(f"target n_ctx={tcfg.n_ctx}  draft n_ctx={dcfg.n_ctx}  "
+          f"rope_scale={tcfg.rope_scaling_factor}")
 
     target = cli.load_model(args.model_dir, tcfg, "cuda", torch.bfloat16,
                             quantize=True, quantize_lm_head=True)
