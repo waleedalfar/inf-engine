@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import time
 from pathlib import Path
 
@@ -62,34 +63,45 @@ def _time_prefill(engine, ids: list[int]) -> float:
     return once()
 
 
-# Prompt source. Deliberately a fixed list rather than a glob: the corpus is
-# built from repo prose, and editing any file in it silently changes the
-# benchmark. Acceptance rate is highly prompt-dependent — it moved 63% -> 74% at
-# 4K across two runs purely because CLAUDE.md had been edited between them,
-# which makes tok/s incomparable while ms/step stays sound.
-_CORPUS_FILES = ("README.md", "docs/ARCHITECTURE.md", "docs/ROADMAP.md", "docs/cli.md")
+# Prompt source: the repo's own prose and source. Prose alone was 11,829 tokens,
+# so a 24k prompt repeated it twice and the draft was predicting text it had
+# already seen — acceptance hit 98.8%, which flatters tok/s badly at exactly the
+# lengths this benchmark exists to measure. Prose + source is ~168k tokens, long
+# enough for 64k with nothing repeated.
+_CORPUS_GLOBS = ("README.md", "docs/*.md", "engine/**/*.py", "tests/*.py")
+
+# Encoded corpus is snapshotted here on first use. Building it from live files
+# every run made the benchmark change whenever the repo did: acceptance moved
+# 63% -> 74% at 4K across two runs with no engine change. Delete this file to
+# re-snapshot after deliberately changing the corpus.
+_CORPUS_CACHE = Path("bench/.corpus_cache.json")
 
 
 def _corpus_ids(tokenizer, need: int) -> tuple[list[int], str]:
-    """Real prose to slice prompts from, plus a fingerprint of it.
+    """Prompt tokens to slice from, plus a fingerprint identifying them.
 
     Returns:
-        ``(ids, digest)``. The digest identifies the corpus; two runs are only
-        comparable on acceptance rate and tok/s if it matches.
+        ``(ids, digest)``. Acceptance rate and tok/s are comparable across runs
+        only when the digest matches; ms/step is unaffected either way.
     """
-    text = ""
-    for name in _CORPUS_FILES:
-        f = Path(name)
-        if f.exists():
-            text += f.read_text(errors="ignore") + "\n\n"
-    if not text:
-        raise SystemExit(f"none of the corpus files exist: {_CORPUS_FILES}")
     ids: list[int] = []
-    while len(ids) < need:
-        ids += tokenizer.encode(text, add_special_tokens=True)
-    digest = hashlib.sha256(
-        ",".join(map(str, ids[:need])).encode()
-    ).hexdigest()[:12]
+    if _CORPUS_CACHE.exists():
+        ids = json.loads(_CORPUS_CACHE.read_text())["ids"]
+
+    if len(ids) < need:
+        text = ""
+        for pattern in _CORPUS_GLOBS:
+            for f in sorted(Path(".").glob(pattern)):
+                text += f.read_text(errors="ignore") + "\n\n"
+        if not text:
+            raise SystemExit(f"no corpus files matched {_CORPUS_GLOBS}")
+        ids = []
+        while len(ids) < need:
+            ids += tokenizer.encode(text, add_special_tokens=True)
+        _CORPUS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        _CORPUS_CACHE.write_text(json.dumps({"ids": ids}))
+
+    digest = hashlib.sha256(",".join(map(str, ids[:need])).encode()).hexdigest()[:12]
     return ids, digest
 
 

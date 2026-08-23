@@ -29,3 +29,4 @@ plots/scratch/
 # the public repo. The distilled, actionable version of each lesson lives in
 # .claude/skills/ (tracked) so future sessions still apply it automatically.
 docs/lessons/
+bench/.corpus_cache.json
