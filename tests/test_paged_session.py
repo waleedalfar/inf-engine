@@ -156,9 +156,13 @@ class _OrderScriptedModel:
         self._seq_to_idx: dict[int, int] = {}
         self._next_engine_seq_id = 0
 
-    def forward(self, input_ids, cache=None, start_pos=0, position_ids=None, attn_mask=None):
+    def forward(self, input_ids, cache=None, start_pos=0, position_ids=None,
+                attn_mask=None, n_logits=None):
+        # n_logits mirrors LlamaModel.forward: prefill asks for just the last
+        # position so the (B, T, vocab) tensor is never materialized.
         logits = self._real.forward(
-            input_ids, cache=cache, start_pos=start_pos, position_ids=position_ids, attn_mask=attn_mask
+            input_ids, cache=cache, start_pos=start_pos, position_ids=position_ids,
+            attn_mask=attn_mask, n_logits=n_logits,
         )
         B = input_ids.shape[0]
         out = torch.full_like(logits, float("-inf"))

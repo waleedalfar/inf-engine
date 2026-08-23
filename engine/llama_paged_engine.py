@@ -284,7 +284,10 @@ class LlamaPagedEngine:
         ids = torch.tensor([req.prompt_ids], device=self.device)      # (1, T_p)
         pos = torch.arange(T_p, device=self.device)
 
-        logits = self.model.forward(ids, cache=self.cache, start_pos=0, position_ids=pos)
+        # Only the final position's logits are used; asking for all of them
+        # allocates (1, prompt_len, vocab) — 9.1 GB at 30k tokens.
+        logits = self.model.forward(ids, cache=self.cache, start_pos=0,
+                                    position_ids=pos, n_logits=1)
         first = sample_next_token(logits[:, -1, :], self.cfg)          # (1, 1)
         req.generated.append(int(first))
         req.start_time = now

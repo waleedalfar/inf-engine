@@ -93,9 +93,13 @@ class _MockLlamaModel:
         start_pos: int = 0,
         position_ids: Any = None,
         attn_mask: Any = None,
+        n_logits: int | None = None,
     ) -> torch.Tensor:
+        # n_logits mirrors LlamaModel.forward: callers that only need the final
+        # position ask for one row instead of the full (B, T, vocab) tensor.
         B, T = input_ids.shape
-        logits = torch.full((B, T, self._vocab_size), float("-inf"))
+        rows = T if n_logits is None else min(n_logits, T)
+        logits = torch.full((B, rows, self._vocab_size), float("-inf"))
         tok = self._seq[self._ptr] if self._ptr < len(self._seq) else 0
         logits[:, -1, tok] = 0.0  # argmax selects tok
         self._ptr += 1

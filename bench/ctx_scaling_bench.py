@@ -121,9 +121,11 @@ def main() -> None:
 
     print(f"\ngenerating {N} tokens per point, "
           f"draft KV={'int8' if d_kv else 'bf16'}, target KV={'int8' if t_kv else 'bf16'}")
+    total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     print(f"{'prompt':>8}{'end ctx':>9}{'K':>4}{'prefill ms':>12}{'decode ms/step':>16}"
-          f"{'decode tok/s':>14}{'e2e tok/s':>11}{'accept':>8}{'tok/step':>10}{'target':>12}")
-    print("-" * 100)
+          f"{'decode tok/s':>14}{'e2e tok/s':>11}{'accept':>8}{'tok/step':>10}"
+          f"{'peak GB':>9}{'target':>12}")
+    print("-" * 112)
 
     for plen, n_draft in [(p, k) for p in args.lengths for k in args.n_draft]:
         if plen + N + 64 > tcfg.n_ctx:
@@ -142,6 +144,8 @@ def main() -> None:
                                  enable_cuda_graphs=True, kv_dtype=d_kv)
             return SpeculativePagedEngine(t, d, n_draft=n_draft, eos_token=None)
 
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
         eng = build()
         # Warm up so graph capture is not billed to the measured run.
         eng.run_offline([LlamaRequest(req_id=0, prompt_ids=ids, max_new_tokens=N)])
@@ -160,12 +164,17 @@ def main() -> None:
         e2e = time.perf_counter() - t0
 
         n = len(res[1])
+        peak_gb = torch.cuda.max_memory_allocated() / 1e9
         decode_s = max(e2e - prefill_ms / 1000, 1e-6)
         tgt = _nearest_target(plen + n)
         tgt_s = f"{tgt[0]}-{tgt[1]}" if tgt else "-"
         print(f"{plen:>8}{plen + n:>9}{n_draft:>4}{prefill_ms:>12.0f}"
               f"{decode_s / st.n_steps * 1000:>16.2f}{n / decode_s:>14.1f}"
-              f"{n / e2e:>11.1f}{st.acceptance_rate:>8.1%}{st.tokens_per_step:>10.2f}{tgt_s:>12}")
+              f"{n / e2e:>11.1f}{st.acceptance_rate:>8.1%}{st.tokens_per_step:>10.2f}"
+              f"{peak_gb:>9.1f}{tgt_s:>12}")
+        if peak_gb > 0.80 * total_gb:
+            print(f"{'':>8}  ^ peak is {peak_gb / total_gb:.0%} of the {total_gb:.1f} GB card — "
+                  "timings past ~80% are allocator thrash, not engine cost")
 
         del eng
         torch.cuda.empty_cache()

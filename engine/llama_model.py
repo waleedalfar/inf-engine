@@ -74,6 +74,7 @@ class LlamaModel:
         start_pos: int = 0,
         position_ids: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
+        n_logits: int | None = None,
     ) -> torch.Tensor:
         """Compute next-token logits for every input position.
 
@@ -87,13 +88,15 @@ class LlamaModel:
                           Defaults to ``arange(start_pos, start_pos + T_q)``.
             attn_mask:    Optional explicit allowed mask (B, T_q, T_total) for
                           continuous batching; overrides causal logic when given.
+            n_logits:     Compute logits for only the final ``n_logits``
+                          positions. None (default) computes all of them.
 
         Returns:
-            Logits over the vocabulary. Shape: (B, T_q, vocab_size)
+            Logits over the vocabulary. Shape: (B, n_logits or T_q, vocab_size)
         """
         return self.forward_stage(
             input_ids, 0, self.config.n_layer, True, True,
-            cache, start_pos, position_ids, attn_mask,
+            cache, start_pos, position_ids, attn_mask, n_logits,
         )
 
     @torch.no_grad()
@@ -108,6 +111,7 @@ class LlamaModel:
         start_pos: int = 0,
         position_ids: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
+        n_logits: int | None = None,
     ) -> torch.Tensor:
         """Run layers ``[start_layer, end_layer)`` of the model.
 
@@ -132,10 +136,16 @@ class LlamaModel:
                           Defaults to ``arange(start_pos, start_pos + T_q)``.
             attn_mask:    Optional explicit allowed mask (B, T_q, T_total) for
                           continuous batching; overrides causal logic when given.
+            n_logits:     Compute logits for only the final ``n_logits``
+                          positions. A prefill needs just the last one, and the
+                          full (B, T, vocab) tensor is enormous — 9.1 GB at
+                          T=30000 for Qwen3's 151936 vocab, which alone pushed a
+                          16 GB card into allocator thrashing. It also runs the
+                          lm_head matmul at M=T instead of M=1.
 
         Returns:
-            Logits (B, T_q, vocab_size) when ``is_last``, otherwise the
-            residual stream (B, T_q, d_model) to hand off to the next stage.
+            Logits (B, n_logits or T_q, vocab_size) when ``is_last``, otherwise
+            the residual stream (B, T_q, d_model) to hand off to the next stage.
         """
         if is_first:
             input_ids = x
@@ -166,9 +176,10 @@ class LlamaModel:
             )
 
         if is_last:
-            x = rms_norm(x, self.w.norm_weight, self.config.norm_eps)  # (B, T_q, d_model)
-            logits = linear(x, self.w.lm_head)                         # (B, T_q, vocab_size)
-            return logits
+            if n_logits is not None and n_logits < x.shape[1]:
+                x = x[:, -n_logits:, :]                                # (B, n_logits, d_model)
+            x = rms_norm(x, self.w.norm_weight, self.config.norm_eps)
+            return linear(x, self.w.lm_head)                            # (B, ?, vocab_size)
         return x
 
     @torch.no_grad()
