@@ -193,6 +193,10 @@ class LlamaPagedEngine:
         graph_len_buckets: Candidate KV-gather lengths, must be multiples of
                          block_size (default: power-of-two block multiples
                          up to model.config.n_ctx).
+        prefill_chunk:   Tokens per prefill forward. Bounds activation memory,
+                         which otherwise grows with prompt length — the fused
+                         gate_up projection alone is 2.16 GB at 24k tokens.
+                         0 disables chunking (one pass over the whole prompt).
         kv_dtype:        KV pool storage dtype (default: the model's dtype).
                          ``torch.float8_e4m3fn`` halves the KV bytes read per
                          token, which is the dominant cost at long context.
@@ -216,11 +220,13 @@ class LlamaPagedEngine:
         graph_batch_buckets: tuple[int, ...] | None = None,
         graph_len_buckets: list[int] | None = None,
         kv_dtype: torch.dtype | None = None,
+        prefill_chunk: int = 2048,
     ) -> None:
         self.model = model
         device = str(model.w.embed_tokens.device)
         dtype = model.w.embed_tokens.dtype
 
+        self.prefill_chunk = prefill_chunk
         self.manager = BlockManager(n_total_blocks, block_size)
         self.cache = PagedLlamaKVCache(model.config, self.manager, device, dtype,
                                        kv_dtype=kv_dtype)
@@ -281,13 +287,7 @@ class LlamaPagedEngine:
         self.cache.allocate_sequence(seq_id, T_p)
         self.cache.begin_step([seq_id])
 
-        ids = torch.tensor([req.prompt_ids], device=self.device)      # (1, T_p)
-        pos = torch.arange(T_p, device=self.device)
-
-        # Only the final position's logits are used; asking for all of them
-        # allocates (1, prompt_len, vocab) — 9.1 GB at 30k tokens.
-        logits = self.model.forward(ids, cache=self.cache, start_pos=0,
-                                    position_ids=pos, n_logits=1)
+        logits = self._prefill_forward(seq_id, req.prompt_ids)
         first = sample_next_token(logits[:, -1, :], self.cfg)          # (1, 1)
         req.generated.append(int(first))
         req.start_time = now
@@ -306,6 +306,40 @@ class LlamaPagedEngine:
             self._active[seq_id] = (req, first.view(1).to(self.device))
             self._generated[seq_id] = [int(first)]
         return done
+
+    @torch.no_grad()
+    def _prefill_forward(self, seq_id: int, prompt_ids: list[int]) -> torch.Tensor:
+        """Run the prompt through the model in chunks; return the last logits.
+
+        Activation memory scales with the number of tokens in flight, not with
+        what the KV cache holds: at 24k tokens the fused gate_up projection alone
+        is a 2.16 GB tensor, and the SwiGLU product another 1.08 GB. Feeding the
+        whole prompt at once put a 16 GB card at 90% occupancy and turned prefill
+        into allocator thrash — 100 s for 24k tokens.
+
+        Chunking bounds that cost at ``prefill_chunk`` tokens regardless of prompt
+        length. Each chunk attends over everything already cached, which
+        llama_attention handles as its offset-causal case, so the result is
+        identical to a single pass.
+
+        Returns:
+            Logits for the final position only. Shape: (1, 1, vocab_size).
+        """
+        T_p = len(prompt_ids)
+        chunk = self.prefill_chunk or T_p
+        logits = None
+        for start in range(0, T_p, chunk):
+            piece = prompt_ids[start:start + chunk]
+            self.cache.ensure_slots_for(seq_id, len(piece))
+            self.cache.begin_step([seq_id])
+            ids = torch.tensor([piece], device=self.device)
+            pos = torch.arange(start, start + len(piece), device=self.device)
+            # Only the last chunk's final row is ever read; asking for all
+            # positions allocates (1, T, vocab) — 9.1 GB at 30k tokens.
+            logits = self.model.forward(
+                ids, cache=self.cache, start_pos=start, position_ids=pos, n_logits=1
+            )
+        return logits
 
     def _evict(self, seq_id: int, req: LlamaRequest, now: float) -> None:
         req.finish_time = now
