@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import time
 from pathlib import Path
 
@@ -61,17 +62,35 @@ def _time_prefill(engine, ids: list[int]) -> float:
     return once()
 
 
-def _corpus_ids(tokenizer, need: int) -> list[int]:
-    """Real prose, long enough to slice any requested prompt length from."""
+# Prompt source. Deliberately a fixed list rather than a glob: the corpus is
+# built from repo prose, and editing any file in it silently changes the
+# benchmark. Acceptance rate is highly prompt-dependent — it moved 63% -> 74% at
+# 4K across two runs purely because CLAUDE.md had been edited between them,
+# which makes tok/s incomparable while ms/step stays sound.
+_CORPUS_FILES = ("README.md", "docs/ARCHITECTURE.md", "docs/ROADMAP.md", "docs/cli.md")
+
+
+def _corpus_ids(tokenizer, need: int) -> tuple[list[int], str]:
+    """Real prose to slice prompts from, plus a fingerprint of it.
+
+    Returns:
+        ``(ids, digest)``. The digest identifies the corpus; two runs are only
+        comparable on acceptance rate and tok/s if it matches.
+    """
     text = ""
-    for p in sorted(Path(".").glob("*.md")) + sorted(Path("docs").rglob("*.md")):
-        text += p.read_text(errors="ignore") + "\n\n"
+    for name in _CORPUS_FILES:
+        f = Path(name)
+        if f.exists():
+            text += f.read_text(errors="ignore") + "\n\n"
     if not text:
-        raise SystemExit("no markdown found to build prompts from")
+        raise SystemExit(f"none of the corpus files exist: {_CORPUS_FILES}")
     ids: list[int] = []
     while len(ids) < need:
         ids += tokenizer.encode(text, add_special_tokens=True)
-    return ids
+    digest = hashlib.sha256(
+        ",".join(map(str, ids[:need])).encode()
+    ).hexdigest()[:12]
+    return ids, digest
 
 
 def main() -> None:
@@ -116,10 +135,12 @@ def main() -> None:
                            quantize=False)
 
     N = args.max_new_tokens
-    all_ids = _corpus_ids(tokenizer, max(args.lengths) + 16)
+    all_ids, corpus_digest = _corpus_ids(tokenizer, max(args.lengths) + 16)
     greedy = SamplingConfig(mode=SamplingMode.GREEDY)
 
-    print(f"\ngenerating {N} tokens per point, "
+    print(f"\ncorpus {corpus_digest} (acceptance is comparable across runs only "
+          f"when this matches)")
+    print(f"generating {N} tokens per point, "
           f"draft KV={'int8' if d_kv else 'bf16'}, target KV={'int8' if t_kv else 'bf16'}")
     total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     print(f"{'prompt':>8}{'end ctx':>9}{'K':>4}{'prefill ms':>12}{'decode ms/step':>16}"
