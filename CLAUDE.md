@@ -5,12 +5,15 @@
 Reach this ladder on a single RTX 5070 Ti. Do not descope it, do not substitute
 an easier target, and do not stop at the rows that already pass.
 
-| context | committed tok/s | measured (2 slices) | status |
+| context | committed tok/s | measured | status |
 |---|---|---|---|
 | ~4K  | **90–120+** | 134.2 / 125.3 | ✅ **above band** |
-| ~16K | **80–90**   | 73.4 / 66.8   | ❌ −10 to −17% |
-| ~32K | **55–65**   | 35.4 / 40.1   | ❌ −27 to −36% |
+| ~16K | **80–90**   | **84.7**      | ✅ **met** |
+| ~32K | **55–65**   | 42.7 / 50.5   | ❌ −9 to −23% |
 | ~64K | **40–42**   | —             | ⛔ not attempted |
+
+Best config: INT8 draft + target KV, split-K INT4 matmul, **draft attention
+window 4096 with 4 sink tokens**, n_draft=4.
 
 Qwen3-8B INT4 target + Qwen3-0.6B draft, INT8 draft KV, n_draft=4.
 16 GB VRAM, 896 GB/s.
@@ -67,7 +70,38 @@ path.** Acceptance moved 72.9% → 81.0% on the *same* 16K prompt slice. tok/s i
 therefore not directly comparable across a numerics change; compare at matched
 acceptance or use isolated kernel timings.
 
-### A3. `n_draft` schedule — IN PROGRESS
+### A3. `n_draft` schedule — ✅ DONE, small
+Measured monotone at 32K (n_draft 2/3/4/6 → 38.9/37.2/35.7/32.0 tok/s at matched
+acceptance) but **flat at 16K** (72.3–78.6, inside a 7.1% noise floor). +9% at
+32K. Real but nowhere near sufficient; it scales the *number* of draft forwards
+and cannot touch what each one costs. No schedule shipped — with A6 in place,
+n_draft=4 measured best at both 16K and 32K.
+
+### A6. Sliding-window draft attention — ✅ DONE, **the lever that met 16K**
+The draft is **65% of per-step KV traffic** at 32K despite being a 0.6B model,
+because Qwen3-0.6B carries the same 8 KV heads × 128 head_dim as the 8B target
+(56 KiB/token vs 72) and runs several forwards per step.
+
+The draft does not need full context: it only *proposes*, and the target's
+accept/reject still yields the target's exact distribution. A windowed draft is
+**correct**, it just accepts slightly less — measured 81.5% vs 81.0% at 16K, i.e.
+essentially free.
+
+| ctx | window | ms/step | tok/s | accept |
+|---|---|---|---|---|
+| 16,584 | full | 45.17 | 76.3 | 81.0% |
+| 16,584 | **4096** | **40.70** | **84.7** | 81.5% |
+| 32,200 | full | 70.71 / 87.60 | 36.3 / 39.4 | 66.1 / 81.0% |
+| 32,200 | **4096** | 61.62 / 62.91 | **42.7 / 50.5** | 66.8 / 76.4% |
+| 32,200 | 2048 | 60.61 | 42.9 | 66.7% |
+
+2048 ≈ 4096, so 4096 is past the knee. `WINDOW`/`N_SINK` are constexpr so the
+branch compiles away for the target; the saving comes from splits outside the
+window skipping their loads, not from masking after the fact.
+
+### A7. Close the remaining 32K gap — NEXT
+42.7–50.5 against 55–65. Profile where 61.62 ms/step goes: rough accounting puts
+draft + target at ~24 ms, leaving ~38 ms unexplained. Measure before choosing.
 Now the main lever. A1 and A2 both addressed costs that are flat in context;
 the draft is **77% of per-step KV traffic** and at 32K each of ~3.5 draft
 forwards per step attends over 32k tokens, so this is the only remaining lever
@@ -201,6 +235,14 @@ cloned its inputs.
 **Near-total output collapse is a bug, not quantization error.** 0.66% injected
 KV noise leaves argmax agreement at 100%; even 10% leaves it at 78%.
 
+**A single anomalous row is usually a transient — verify before acting on it.**
+A 16K row read 82.40 ms/step against 43.89 for the same config; windowing can
+only remove work, so instead of reverting, the draft replay was profiled
+directly and found 22% *faster*. The clean re-run gave 40.70 ms — the row that
+met the 16K target. Trusting the anomaly would have discarded the winning change.
+Run-to-run variance on identical work measured **7.1%**; treat anything smaller
+as noise, and anything wildly larger as suspect rather than real.
+
 **Suspect the measurement apparatus first.** Every wrong conclusion in this
 project came from the harness: an L2-cached kernel sweep, `.clone()`d test
 tensors, a benchmark that stood up three KV pools and read its own allocator
@@ -228,6 +270,8 @@ Keep this current. One line per landed change, newest last.
 - 2026-08-23 — Cleared stale docs; CLAUDE.md rebuilt around measured results
 - 2026-08-23 — A1: target-KV INT8 passes quality gate; 32K peak 14.5 → 12.2 GB, now measurable
 - 2026-08-23 — A2: split-K INT4 matmul (deterministic reduce); 4K 115.7 → 134.2 tok/s
+- 2026-08-23 — A3: n_draft sweep — monotone at 32K (+9%), flat at 16K; n_draft=4 kept
+- 2026-08-23 — A6: sliding-window draft attention; **16K met at 84.7 tok/s**, 32K 36.3 → 42.7
 
 ---
 
