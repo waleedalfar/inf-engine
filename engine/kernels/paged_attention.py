@@ -245,25 +245,6 @@ def _pick_splits(kv_len: int, n_ctas_per_split: int, target_ctas: int = 512) -> 
     return max(1, min(want, triton.cdiv(kv_len, 128), 64))
 
 
-_SCRATCH: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
-
-
-def _scratch(key: tuple, acc_shape: tuple, lse_shape: tuple, device) -> tuple:
-    """Reusable per-shape workspace for the split partials.
-
-    Allocating these per call showed up as real cost at short context, where
-    there is little KV to read. Holding them in a module-level cache is also
-    what CUDA-graph capture wants: the pointers are baked into the graph at
-    capture time, and a live reference here keeps them from being freed.
-    """
-    buf = _SCRATCH.get(key)
-    if buf is None:
-        buf = (torch.empty(acc_shape, device=device, dtype=torch.float32),
-               torch.empty(lse_shape, device=device, dtype=torch.float32))
-        _SCRATCH[key] = buf
-    return buf
-
-
 def paged_flash_attention(
     q: torch.Tensor,
     k_pool: torch.Tensor,
@@ -276,6 +257,7 @@ def paged_flash_attention(
     v_scale: torch.Tensor | None = None,
     n_splits: int | None = None,
     block_n: int = 64,
+    scratch: dict | None = None,
 ) -> torch.Tensor:
     """GQA-native paged attention over a KV history held in physical blocks.
 
@@ -296,6 +278,15 @@ def paged_flash_attention(
         n_splits:    KV splits. Must be a Python int (constant per CUDA-graph
                      capture); defaults to a heuristic from ``kv_lens.max()``.
         block_n:     KV positions processed per inner iteration.
+        scratch:     Caller-owned dict for the split-partial workspace, so its
+                     lifetime is the caller's. **Required for CUDA-graph use.**
+                     A graph bakes in the pointer at capture time, so the buffer
+                     must outlive the graph and must not have been allocated
+                     inside a *different* graph's private memory pool — which is
+                     what a module-global cache shared across engines produced
+                     (illegal memory access once the first engine was freed).
+                     Pass the dict that lives alongside the graphs; allocation
+                     then happens during warmup, outside any capture.
 
     Returns:
         ``(B, n_head, q_len, D)``, same dtype as ``q``.
@@ -323,10 +314,16 @@ def paged_flash_attention(
     split_len = triton.cdiv(triton.cdiv(max_len, n_splits), block_n) * block_n
 
     single = n_splits == 1
-    acc, lse = _scratch(
-        (q.device, B, n_kv, n_splits, BLOCK_M, BLOCK_D),
-        (B, n_kv, n_splits, BLOCK_M, BLOCK_D), (B, n_kv, n_splits, BLOCK_M), q.device,
-    )
+    key = (B, n_kv, n_splits, BLOCK_M, BLOCK_D, q_len, n_rep)
+    store = scratch if scratch is not None else {}
+    buf = store.get(key)
+    if buf is None:
+        buf = (torch.empty((B, n_kv, n_splits, BLOCK_M, BLOCK_D),
+                           device=q.device, dtype=torch.float32),
+               torch.empty((B, n_kv, n_splits, BLOCK_M),
+                           device=q.device, dtype=torch.float32))
+        store[key] = buf
+    acc, lse = buf
     out = torch.empty_like(q)
 
     _paged_flash_decode_kernel[(B, n_kv, n_splits)](

@@ -312,3 +312,56 @@ def test_gemv_vs_matmul_dispatch():
 
     rel = ((out1 - out2[:1]).norm() / (out1.norm() + 1e-8)).item()
     assert rel < 0.01, f"GEMV and tile matmul disagree: rel={rel:.4f}"
+
+
+# ---------------------------------------------------------------------------
+# Large-M addressing (regression)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused INT4 kernel requires CUDA")
+def test_int4_matmul_large_m_no_int32_overflow():
+    """Output addressing must survive M * N beyond int32.
+
+    Regression. ``offs_m * stride_cm`` reaches M * vocab_size; at Qwen3-8B's
+    151936 vocab that passes int32's 2.15e9 ceiling once M >= ~14134. The
+    overflow wrapped to a negative offset, every masked store was dropped, and
+    the caller got an all-zero logit tensor with no error — so prefills of
+    ~14k tokens or more silently produced garbage while 12k worked.
+
+    Exercising it genuinely requires an output of more than 2**31 elements
+    (~5 GB at bf16), so K is kept tiny and only slices are ever widened to
+    float32.
+    """
+    from engine.kernels.quant import int4_matmul, quantize_weight_int4
+
+    K, N, M = 128, 151936, 16384
+    assert M * N > 2**31 - 1, "test no longer exercises the overflow"
+
+    torch.cuda.empty_cache()
+    free, _ = torch.cuda.mem_get_info()
+    if free < 7 * 1024**3:
+        pytest.skip(f"needs ~7 GB free for a >2**31-element output, have {free/1024**3:.1f} GB")
+
+    torch.manual_seed(0)
+    w = torch.randn(K, N, device="cuda", dtype=torch.float32) * 0.02
+    packed, scale = quantize_weight_int4(w, 128)
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+
+    out = int4_matmul(a, packed, scale, 128)
+    assert out.shape == (M, N)
+
+    # The failure mode is silence: right shape, finite, and entirely zero. Check
+    # the last rows — those are the ones whose offsets overflowed.
+    tail = out[-8:, :512].float()
+    del out
+    torch.cuda.empty_cache()
+    assert tail.abs().max() > 0, (
+        "rows past the int32 boundary came back all-zero — stores were dropped"
+    )
+    # Norm-based: INT4 with a single 128-wide group has several percent of
+    # element-wise error, and per-element relative error blows up on outputs
+    # near zero. What matters is that these rows carry the right signal.
+    ref = a[-8:].float() @ w[:, :512]
+    rel = (tail - ref).norm() / ref.norm()
+    # 0.2 still separates "quantization error" from the all-zero failure (1.0).
+    assert rel < 0.2, f"tail rows differ from reference by {rel:.1%}"

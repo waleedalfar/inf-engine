@@ -179,7 +179,12 @@ def _int4_matmul_kernel(
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    offs_m    = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)      # (BLOCK_M,)
+    # int64 row indices. tl.arange is int32, and the output offset
+    # offs_m * stride_cm reaches M * vocab_size — 16384 * 151936 = 2.49e9, past
+    # int32's 2.15e9 ceiling. The overflow wraps to a negative offset, every
+    # masked store is dropped, and the caller gets an all-zero logit tensor with
+    # no error: prefills of ~14k tokens or more silently produced garbage.
+    offs_m    = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)   # (BLOCK_M,)
     offs_n    = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)      # (BLOCK_N,)
     offs_half = tl.arange(0, GROUP_SIZE // 2)                 # (64,) — index within packed group
 

@@ -163,6 +163,11 @@ class PagedLlamaKVCache:
         self.block_table: dict[int, list[int]] = {}
         self.seq_lens: dict[int, int] = {}
         self._active: list[int] = []
+        # Split-partial workspace for the paged attention kernel. Owned here so
+        # its lifetime matches this cache (and therefore its engine's graphs)
+        # rather than the process — a global cache handed one engine's graph a
+        # buffer allocated inside another's private pool.
+        self._attn_scratch: dict = {}
 
     # ------------------------------------------------------------------
     # Sequence lifecycle
@@ -538,7 +543,7 @@ class PagedLlamaKVCache:
             page_size=self.manager.block_size,
             k_scale=self.k_scale[local_layer] if self.quantized else None,
             v_scale=self.v_scale[local_layer] if self.quantized else None,
-            n_splits=n_splits,
+            n_splits=n_splits, scratch=self._attn_scratch,
         )
 
     def extend_static(
