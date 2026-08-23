@@ -139,18 +139,40 @@ the whole overflow: target 5.0 + draft 3.65 + weights 5.4 = 14 GB before
 activations, and prefill pushes it over.
 
 **Fix: bound the draft's KV *allocation* to window + sinks** (~0.27 GB), not just
-its reads. This is a rolling/ring-buffer paged cache and it is **not contained** —
-`PagedLlamaKVCache` maps logical position → physical block linearly
-(`block_table[p // bs]`), and that assumption is threaded through `write_kv_quant`,
-the gather in `extend()`, `build_static_buffers`, the paged-attention kernel's
-position→block indexing, and graph capture. A ring buffer breaks it everywhere.
-Plan: give the windowed draft cache a ring of `ceil((sinks+window)/bs)+margin`
-physical blocks, a position→ring-slot map, and evict-oldest-non-sink on
-`ensure_slot`; update the write/gather/kernel indexing to consult the map; keep
-the sink blocks pinned. **Full correctness gate afterward** (greedy
-token-identical vs baseline > 50 tokens) — this is a KV-cache change, the exact
-class the gate exists for. Cheaper alternative to evaluate first: INT4 draft KV
-(3.65 → 1.85 GB) may just fit and touches only the quant path, not the mapping.
+its reads. The VRAM lever is concrete — the pool is one `torch.zeros((n_layers,
+n_total_blocks, ...))` sized at construction (`paged_cache.py:165`), so the draft
+engine just needs a small `BlockManager(n_total ≈ ceil((sinks+window)/bs)+margin)`.
+Making a long sequence live in that small pool is the ring buffer, and tracing it
+end-to-end shows **three coupled pieces**, in the order to build+gate them:
+
+1. **Decode-side recycling** (tractable core). In windowed mode, `ensure_slot`
+   recycles out-of-window non-sink physical blocks instead of `allocate`-ing new:
+   repoint their logical `block_table` entries at a pinned sink block (a valid pool
+   index the windowed kernel never reads, exactly like the existing column
+   padding), free the physical, reuse it for the new position. `reset_to` and the
+   `block_table` full-length list stay as-is; only physical residency shrinks.
+   Unit-test: the ring's gathered/attended KV for in-window+sink positions is
+   bit-identical to a full cache's, across many block recycles.
+
+2. **Bounded prefill.** `_prefill_forward` allocates all blocks and gathers full
+   history via eager `extend()` — no windowing, and the flash-*decoding*
+   `paged_attend` (q_len 1–5) is the wrong tool for 2048-token chunks. The draft
+   prefill must either window the eager path (recycle between chunks + mask beyond
+   window) or prefill only `[sinks]+[last window]` tokens. Prefill peak, not just
+   steady state, must fit the small pool.
+
+3. **Spec-loop length decoupling.** `_generate_one` assumes draft and target
+   caches share length `L` and rolls both back to `L+n+1`
+   (`speculative_paged_engine.py:175,234`). A shorter draft cache needs its own
+   length tracked and its own rollback offset.
+
+**Full correctness gate after each piece** (greedy speculative == single-model
+baseline, token-identical > 50 tokens) — this is a KV-cache change, the exact
+class the gate exists for. Do it on a branch; keep `main` green.
+
+Cheaper alternative if 64K is wanted sooner: INT4 draft KV (3.65 → 1.85 GB, total
+~14 GB — may just fit under the thrash line) touches only the quant path, not any
+of the three couplings above. Lower ceiling, far lower risk.
 
 ### A5. Full ladder, multi-slice
 Re-measure 4K/16K/32K with `--slices 3+`, then 64K once it fits. Use a **fresh
