@@ -112,6 +112,13 @@ def main() -> None:
     ap.add_argument("--max-new-tokens", type=int, default=200)
     ap.add_argument("--n-draft", type=int, nargs="+", default=[4],
                     help="One value, or several to sweep at each context length.")
+    ap.add_argument("--slices", type=int, default=1,
+                    help="Distinct prompt slices to measure per point, taken at "
+                         "evenly spaced offsets through the corpus. Acceptance "
+                         "varies a lot with content — the repo's Python source "
+                         "yields 96%% where prose yields 80%% — so one slice is "
+                         "one sample, not the throughput at that context length. "
+                         "Every slice is reported; nothing is averaged away.")
     ap.add_argument("--lengths", type=int, nargs="+",
                     default=[256, 1024, 4096, 8192, 16384, 32768])
     ap.add_argument("--draft-kv-int8", action="store_true",
@@ -155,17 +162,22 @@ def main() -> None:
     print(f"generating {N} tokens per point, "
           f"draft KV={'int8' if d_kv else 'bf16'}, target KV={'int8' if t_kv else 'bf16'}")
     total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    print(f"{'prompt':>8}{'end ctx':>9}{'K':>4}{'prefill ms':>12}{'decode ms/step':>16}"
+    print(f"{'prompt':>8}{'end ctx':>9}{'K':>4}{'sl':>4}{'prefill ms':>12}{'decode ms/step':>16}"
           f"{'decode tok/s':>14}{'e2e tok/s':>11}{'accept':>8}{'tok/step':>10}"
           f"{'peak GB':>9}{'target':>12}")
     print("-" * 112)
 
-    for plen, n_draft in [(p, k) for p in args.lengths for k in args.n_draft]:
+    points = [(p, k, i) for p in args.lengths for k in args.n_draft
+              for i in range(args.slices)]
+    for plen, n_draft, slice_i in points:
         if plen + N + 64 > tcfg.n_ctx:
             print(f"{plen:>8}   skipped — exceeds n_ctx={tcfg.n_ctx} "
                   f"(needs RoPE scaling; see CLAUDE.md)")
             continue
-        ids = all_ids[:plen]
+        # Evenly spaced offsets so slices sample different material.
+        span = max(len(all_ids) - plen - 1, 1)
+        offset = (span // max(args.slices, 1)) * slice_i
+        ids = all_ids[offset:offset + plen]
         n_blocks = (plen + N + n_draft + 64) // 16 + 64
 
         def build():
@@ -201,7 +213,7 @@ def main() -> None:
         decode_s = max(e2e - prefill_ms / 1000, 1e-6)
         tgt = _nearest_target(plen + n)
         tgt_s = f"{tgt[0]}-{tgt[1]}" if tgt else "-"
-        print(f"{plen:>8}{plen + n:>9}{n_draft:>4}{prefill_ms:>12.0f}"
+        print(f"{plen:>8}{plen + n:>9}{n_draft:>4}{slice_i:>4}{prefill_ms:>12.0f}"
               f"{decode_s / st.n_steps * 1000:>16.2f}{n / decode_s:>14.1f}"
               f"{n / e2e:>11.1f}{st.acceptance_rate:>8.1%}{st.tokens_per_step:>10.2f}"
               f"{peak_gb:>9.1f}{tgt_s:>12}")
