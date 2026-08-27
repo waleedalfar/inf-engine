@@ -463,9 +463,17 @@ class SpeculativeGraphedAgentLoop(VerboseAgentLoop):
         trim = gen_ids[:-1] if gen_ids and gen_ids[-1] == self.eos_token_id else gen_ids
         text = self.tokenizer.decode(trim, skip_special_tokens=False)
         print(text, flush=True)
+        # Report decode and prefill separately. End-to-end tok/s folds in
+        # prefill, and this loop re-prefills the whole conversation every turn
+        # (no cross-turn prefix reuse), so after a tool call injects a few
+        # thousand tokens the e2e figure is dominated by re-reading them — it can
+        # look an order of magnitude slower while decode is unchanged. Only the
+        # decode figure is comparable to the numbers in CLAUDE.md.
         print(
-            f"\n  [{n_gen} tokens, {tps:.2f} tok/s | "
-            f"accept {stats.acceptance_rate:.0%}, "
+            f"\n  [{n_gen} tokens | decode {stats.decode_tokens_per_s:.1f} tok/s "
+            f"({stats.ms_per_step:.1f} ms/step) | "
+            f"prefill {stats.prefill_s * 1000:.0f} ms for {len(ids)} tok | "
+            f"e2e {tps:.1f} tok/s | accept {stats.acceptance_rate:.0%}, "
             f"{stats.tokens_per_step:.1f} tok/step]",
             flush=True,
         )

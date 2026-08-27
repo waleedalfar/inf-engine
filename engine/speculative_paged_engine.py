@@ -99,6 +99,8 @@ class SpeculativePagedEngine:
             combined.n_rejected += stats.n_rejected
             combined.n_bonus += stats.n_bonus
             combined.n_steps += stats.n_steps
+            combined.prefill_s += stats.prefill_s
+            combined.decode_s += stats.decode_s
         return results, combined
 
     def _n_draft_for(self, context_len: int) -> int:
@@ -142,7 +144,13 @@ class SpeculativePagedEngine:
         first_tok_tensor = target._active[t_sid][1]
         draft._active[d_sid] = (draft_req, first_tok_tensor.to(draft.device))
 
-        stats = SpecStats()
+        # Prefill (both models) is done; everything after this is decode.
+        # Separating them matters: a long prompt with a short answer makes
+        # end-to-end tok/s look far worse than the decode rate actually is.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        decode_start = time.perf_counter()
+        stats = SpecStats(prefill_s=decode_start - now)
 
         # Repetition-penalty context. Only materialised when a penalty is
         # actually configured — otherwise _get_probs ignores it and rebuilding
@@ -278,6 +286,10 @@ class SpeculativePagedEngine:
         if d_sid in draft.cache.seq_lens:
             draft.cache.free_sequence(d_sid)
         draft._generated.pop(d_sid, None)
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        stats.decode_s = time.perf_counter() - decode_start
 
         # Remove spurious completions added by _prefill (if any re-queued).
         target.completed = [r for r in target.completed if r.req_id != req.req_id]

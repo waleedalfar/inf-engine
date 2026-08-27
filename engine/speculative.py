@@ -68,6 +68,24 @@ class SpecStats:
     n_rejected: int = 0    # draft tokens rejected (one per speculative step that fails)
     n_bonus: int = 0       # bonus tokens emitted when all K drafts accepted
     n_steps: int = 0       # number of speculative steps taken
+    prefill_s: float = 0.0  # wall time in prefill (target + draft)
+    decode_s: float = 0.0   # wall time in the speculative decode loop
+
+    @property
+    def decode_tokens_per_s(self) -> float:
+        """Steady-state decode rate, excluding prefill.
+
+        This is the figure the project's targets are stated in. End-to-end
+        tok/s folds in prefill and therefore depends on prompt length and on how
+        many tokens were requested — a long prompt with a short answer can look
+        an order of magnitude slower while decoding at exactly the same rate.
+        """
+        total = self.n_accepted + self.n_rejected + self.n_bonus
+        return total / self.decode_s if self.decode_s > 0 else 0.0
+
+    @property
+    def ms_per_step(self) -> float:
+        return self.decode_s / self.n_steps * 1000 if self.n_steps > 0 else 0.0
 
     @property
     def acceptance_rate(self) -> float:
