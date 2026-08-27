@@ -226,15 +226,18 @@ class LlamaPagedEngine:
         kv_dtype: torch.dtype | None = None,
         prefill_chunk: int = 2048,
         attn_window: int = 0,
+        window_ring: bool = False,
     ) -> None:
         self.model = model
         device = str(model.w.embed_tokens.device)
         dtype = model.w.embed_tokens.dtype
 
         self.prefill_chunk = prefill_chunk
+        self.attn_window = attn_window
         self.manager = BlockManager(n_total_blocks, block_size)
         self.cache = PagedLlamaKVCache(model.config, self.manager, device, dtype,
-                                       kv_dtype=kv_dtype, attn_window=attn_window)
+                                       kv_dtype=kv_dtype, attn_window=attn_window,
+                                       window_ring=window_ring)
         self.cfg = sampling or SamplingConfig()
         self.eos = eos_token
         self.max_queue_depth = max_queue_depth
@@ -333,16 +336,33 @@ class LlamaPagedEngine:
         T_p = len(prompt_ids)
         chunk = self.prefill_chunk or T_p
         logits = None
+        ring = self.cache.window_ring
+        window = self.attn_window
+        n_sink = self.cache.attn_sinks
         for start in range(0, T_p, chunk):
             piece = prompt_ids[start:start + chunk]
-            self.cache.ensure_slots_for(seq_id, len(piece))
+            L = len(piece)
+            self.cache.ensure_slots_for(seq_id, L)
             self.cache.begin_step([seq_id])
             ids = torch.tensor([piece], device=self.device)
-            pos = torch.arange(start, start + len(piece), device=self.device)
+            pos = torch.arange(start, start + L, device=self.device)
+            # In ring mode the gather returns the full [0, start+L) width but the
+            # out-of-window blocks have been recycled onto a pinned block (garbage
+            # for those positions). A per-row windowed causal mask excludes them,
+            # so the draft's prompt KV is computed windowed — the same view its
+            # decode uses — rather than full-context. Without ring mode there is
+            # no mask and prefill stays offset-causal, unchanged.
+            attn_mask = None
+            if ring:
+                kv_len = start + L
+                q_pos = pos.view(L, 1)
+                j = torch.arange(kv_len, device=self.device).view(1, kv_len)
+                attn_mask = ((j <= q_pos) & ((j >= q_pos - window + 1) | (j < n_sink))).unsqueeze(0)
             # Only the last chunk's final row is ever read; asking for all
             # positions allocates (1, T, vocab) — 9.1 GB at 30k tokens.
             logits = self.model.forward(
-                ids, cache=self.cache, start_pos=start, position_ids=pos, n_logits=1
+                ids, cache=self.cache, start_pos=start, position_ids=pos,
+                n_logits=1, attn_mask=attn_mask,
             )
         return logits
 
@@ -635,6 +655,11 @@ class LlamaPagedEngine:
         seq_lens_t = torch.tensor([L], device=self.device)
         ar = torch.arange(L + 1, device=self.device)
         attn_mask = (ar[None, :] <= seq_lens_t[:, None])[:, None, :]    # (1, 1, L+1)
+        if self.cache.window_ring:
+            # Match the fused kernel's window (and exclude recycled positions):
+            # admit the last `window` keys plus the first `n_sink`.
+            keep = (ar >= (L - self.attn_window + 1)) | (ar < self.cache.attn_sinks)
+            attn_mask = attn_mask & keep[None, None, :]
         ids = self._active[seq_id][1].view(1, 1)
         pos = seq_lens_t.view(1, 1)
         self.cache.begin_step([seq_id])

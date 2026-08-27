@@ -625,6 +625,32 @@ def main():
         "--n-draft", type=int, default=4,
         help="Number of draft tokens to speculate per step (default: 4).",
     )
+    parser.add_argument(
+        "--draft-kv-int8", action="store_true",
+        help="Store the draft's KV cache in INT8. Halves the traffic term that "
+             "dominates long context, and is free in principle: the draft only "
+             "proposes, and the target's accept/reject still yields the target's "
+             "exact output distribution.",
+    )
+    parser.add_argument(
+        "--target-kv-int8", action="store_true",
+        help="Store the TARGET's KV cache in INT8 too. This one does change the "
+             "model's own distribution; it passed a perplexity/top-1 gate "
+             "(bench/kv_quality_gate.py) but is opt-in for that reason.",
+    )
+    parser.add_argument(
+        "--draft-window", type=int, default=0,
+        help="Sliding-window attention for the draft only (0 = full context). "
+             "The draft is most of per-step KV traffic at long context because "
+             "Qwen3-0.6B carries the same 8 KV heads x 128 head_dim as the 8B "
+             "target. Costs a little acceptance, never correctness. 4096 measured "
+             "best.",
+    )
+    parser.add_argument(
+        "--fast", action="store_true",
+        help="Shorthand for the fastest measured configuration: "
+             "--draft-kv-int8 --target-kv-int8 --draft-window 4096.",
+    )
     quant_group = parser.add_mutually_exclusive_group()
     quant_group.add_argument(
         "--quantize", dest="quantize", action="store_const", const=True,
@@ -796,6 +822,9 @@ def main():
         # Best path: spec decode with CUDA-graphed draft + graphed verify target.
         block_size = 16
         n_blocks = (args.max_ctx + block_size - 1) // block_size + 64
+        draft_kv = torch.int8 if (args.draft_kv_int8 or args.fast) else None
+        target_kv = torch.int8 if (args.target_kv_int8 or args.fast) else None
+        draft_window = args.draft_window or (4096 if args.fast else 0)
         target_engine = LlamaPagedEngine(
             model,
             n_total_blocks=n_blocks,
@@ -803,6 +832,7 @@ def main():
             eos_token=tokenizer.im_end_id,
             sampling=agent_kwargs["sampling"],
             enable_cuda_graphs=True,    # target uses graphed verify (q_len=K+1)
+            kv_dtype=target_kv,
         )
         draft_engine = LlamaPagedEngine(
             draft_model,
@@ -811,6 +841,8 @@ def main():
             eos_token=tokenizer.im_end_id,
             sampling=agent_kwargs["sampling"],
             enable_cuda_graphs=True,    # draft uses CUDA graphs for q_len=1 steps
+            kv_dtype=draft_kv,
+            attn_window=draft_window,
         )
         spec_paged = SpeculativePagedEngine(
             target_engine, draft_engine,
@@ -820,7 +852,10 @@ def main():
         agent = SpeculativeGraphedAgentLoop(**agent_kwargs, engine=spec_paged)
         print(
             f"Spec+CUDA-graph decode enabled: {draft_config.name} draft, "
-            f"{args.n_draft} tokens/step."
+            f"{args.n_draft} tokens/step, "
+            f"draft KV={'int8' if draft_kv else 'bf16'}, "
+            f"target KV={'int8' if target_kv else 'bf16'}, "
+            f"draft window={draft_window or 'full'}."
         )
     elif draft_model is not None:
         spec_decoder = SpeculativeDecoder(draft=draft_model, target=model, n_draft=args.n_draft)

@@ -117,6 +117,7 @@ class PagedLlamaKVCache:
         kv_dtype: torch.dtype | None = None,
         attn_window: int = 0,
         attn_sinks: int = 4,
+        window_ring: bool = False,
     ) -> None:
         """
         Args:
@@ -129,6 +130,19 @@ class PagedLlamaKVCache:
                 the same 8 KV heads x 128 head_dim as the 8B target.
             attn_sinks: Leading positions always attended when windowed.
                 Windowed attention degrades sharply without a few of these.
+            window_ring: Bound *physical* KV residency to the window + sinks
+                instead of the full sequence. Only valid with ``attn_window`` and
+                only on a draft engine. The logical ``block_table`` still spans the
+                full absolute length (so positions, the graph buckets, the kernel
+                and the spec loop are all unchanged), but blocks whose every
+                position has fallen out of ``[0, attn_sinks) ∪ (len-window, len]``
+                are recycled: their block-table entries are repointed at a pinned
+                sink block (a valid pool index the windowed kernel never reads —
+                exactly the existing column-padding trick) and their physical
+                block is freed for reuse. This lets a 64k draft live in a pool of
+                ~``(sinks+window)/block_size`` blocks (~0.27 GB) instead of ~3.7 GB.
+                The eager gather path must be given a windowed mask so it excludes
+                the repointed positions; the fused paged kernel already does.
             kv_dtype: Storage dtype for the K/V pool. Defaults to ``dtype``.
                 Pass ``torch.int8`` (preferred) or ``torch.float8_e4m3fn``
                 to halve the pool — and, more to
@@ -181,6 +195,14 @@ class PagedLlamaKVCache:
         self._attn_scratch: dict = {}
         self.attn_window = attn_window
         self.attn_sinks = attn_sinks if attn_window else 0
+        self.window_ring = bool(window_ring and attn_window)
+        # Blocks covering the sink positions stay resident forever (block 0 holds
+        # positions [0, block_size), which subsumes the ≤ block_size sinks).
+        self._sink_blocks = math.ceil(self.attn_sinks / manager.block_size) if self.window_ring else 0
+        # Per-seq: lowest logical block index (≥ _sink_blocks) still backed by its
+        # own physical block. Entries in [_sink_blocks, _live_lo) are recycled and
+        # point at the pinned sink block.
+        self._live_lo: dict[int, int] = {}
 
     # ------------------------------------------------------------------
     # Sequence lifecycle
@@ -194,6 +216,14 @@ class PagedLlamaKVCache:
         """
         if seq_id in self.block_table:
             raise ValueError(f"seq_id={seq_id} is already allocated; call free_sequence first")
+        if self.window_ring:
+            # Ring mode grows and recycles through ensure_slots_for, so only the
+            # first (sink-bearing) block is reserved up front — allocating
+            # blocks_needed(prompt_len) would exhaust the deliberately-small pool.
+            self.block_table[seq_id] = self.manager.allocate(1)
+            self.seq_lens[seq_id] = 0
+            self._live_lo[seq_id] = self._sink_blocks
+            return
         n = self.manager.blocks_needed(max(prompt_len, 1))
         self.block_table[seq_id] = self.manager.allocate(n)
         self.seq_lens[seq_id] = 0
@@ -206,6 +236,9 @@ class PagedLlamaKVCache:
         count is an exact multiple of ``block_size``, the last block is full and
         a new physical block is appended.
         """
+        if self.window_ring:
+            self.ensure_slots_for(seq_id, 1)
+            return
         length = self.seq_lens[seq_id]
         if length > 0 and length % self.manager.block_size == 0:
             self.block_table[seq_id].extend(self.manager.allocate(1))
@@ -221,13 +254,68 @@ class PagedLlamaKVCache:
         length = self.seq_lens[seq_id]
         needed = self.manager.blocks_needed(length + n_tokens)
         current = len(self.block_table[seq_id])
-        if needed > current:
+        if needed <= current:
+            return
+        if not self.window_ring:
             self.block_table[seq_id].extend(self.manager.allocate(needed - current))
+            return
+        self._grow_ring(seq_id, needed)
+
+    def _grow_ring(self, seq_id: int, needed: int) -> None:
+        """Grow ``block_table[seq_id]`` to ``needed`` logical blocks under the
+        window budget, recycling blocks that have fallen fully out of window.
+
+        A block at logical index ``b`` covers positions ``[b*bs, (b+1)*bs)``; it is
+        recyclable once its last position is below ``needed*bs - window`` (fully
+        past the window) and ``b >= _sink_blocks`` (past the pinned sinks). Its
+        entry is repointed at the pinned sink block — a valid pool index the
+        windowed kernel never loads — and its physical block funds a new in-window
+        block. Net live physical blocks stay at ``_sink_blocks + window/bs (+1)``.
+        """
+        bt = self.block_table[seq_id]
+        current = len(bt)
+        bs = self.manager.block_size
+        pinned = bt[0]
+        # Recycle relative to the CURRENT length, not the grown length: the tokens
+        # about to be written are queries at positions ≥ seq_lens, and the
+        # earliest of them (at exactly seq_lens) still attends back to
+        # seq_lens - window + 1. Using needed*bs here would recycle KV that the
+        # first query in a multi-token grow (a 2048-token prefill chunk) still
+        # needs. Keep one extra block of slack by flooring on (len - window).
+        length = self.seq_lens[seq_id]
+        win_lo_block = max(self._sink_blocks, (length - self.attn_window) // bs)
+
+        reclaimed: list[int] = []
+        b = self._live_lo[seq_id]
+        while b < win_lo_block and b < current:
+            phys = bt[b]
+            if phys != pinned:
+                bt[b] = pinned
+                reclaimed.append(phys)
+            b += 1
+        self._live_lo[seq_id] = max(self._live_lo[seq_id], min(win_lo_block, current))
+
+        for idx in range(current, needed):
+            if idx < win_lo_block:
+                bt.append(pinned)                       # born already out of window
+                self._live_lo[seq_id] = idx + 1
+            elif reclaimed:
+                bt.append(reclaimed.pop())
+            else:
+                bt.extend(self.manager.allocate(1))
+        if reclaimed:
+            self.manager.free(reclaimed)
 
     def free_sequence(self, seq_id: int) -> None:
         """Return all physical blocks of ``seq_id`` to the pool."""
-        self.manager.free(self.block_table.pop(seq_id, []))
+        blocks = self.block_table.pop(seq_id, [])
+        if self.window_ring:
+            # Recycled entries alias the pinned sink block (block 0); free each
+            # physical block once or the pool's free list gets duplicate ids.
+            blocks = list(dict.fromkeys(blocks))
+        self.manager.free(blocks)
         self.seq_lens.pop(seq_id, None)
+        self._live_lo.pop(seq_id, None)
 
     def reset_to(self, seq_id: int, pos: int) -> None:
         """Roll back a sequence to ``pos`` filled tokens.
@@ -250,10 +338,17 @@ class PagedLlamaKVCache:
         # Blocks needed to hold pos tokens (at least 1 so the sequence is never
         # left with zero blocks, matching the invariant set by allocate_sequence).
         keep = max(self.manager.blocks_needed(pos), 1)
-        excess = self.block_table[seq_id][keep:]
+        bt = self.block_table[seq_id]
+        excess = bt[keep:]
         if excess:
+            if self.window_ring:
+                # Never return the pinned sink block or a recycled alias of it to
+                # the pool, and free each real physical block only once.
+                pinned = bt[0]
+                excess = [b for b in dict.fromkeys(excess) if b != pinned]
+                self._live_lo[seq_id] = min(self._live_lo[seq_id], keep)
             self.manager.free(excess)
-            self.block_table[seq_id] = self.block_table[seq_id][:keep]
+            self.block_table[seq_id] = bt[:keep]
         self.seq_lens[seq_id] = pos
 
     # ------------------------------------------------------------------
