@@ -645,6 +645,20 @@ def main():
              "exact output distribution.",
     )
     parser.add_argument(
+        "--draft-ring", action="store_true",
+        help="Bound the draft's KV pool to its attention window rather than the "
+             "full context. Needs --draft-window (which --fast sets); --fast "
+             "does NOT turn this on by itself. The draft never reads past its "
+             "window, so this costs VRAM bookkeeping and no precision.",
+    )
+    parser.add_argument(
+        "--draft-kv-int4", action="store_true",
+        help="Store the draft's KV cache as packed INT4 nibbles — half again "
+             "against --draft-kv-int8, on the same safety argument. Overrides "
+             "--draft-kv-int8. Draft-side only; the target's KV precision "
+             "changes its own distribution and is gated separately.",
+    )
+    parser.add_argument(
         "--target-kv-int8", action="store_true",
         help="Store the TARGET's KV cache in INT8 too. This one does change the "
              "model's own distribution; it passed a perplexity/top-1 gate "
@@ -834,7 +848,11 @@ def main():
         # Best path: spec decode with CUDA-graphed draft + graphed verify target.
         block_size = 16
         n_blocks = (args.max_ctx + block_size - 1) // block_size + 64
-        draft_kv = torch.int8 if (args.draft_kv_int8 or args.fast) else None
+        if args.draft_kv_int4:
+            from engine.paged_cache import INT4
+            draft_kv = INT4
+        else:
+            draft_kv = torch.int8 if (args.draft_kv_int8 or args.fast) else None
         target_kv = torch.int8 if (args.target_kv_int8 or args.fast) else None
         draft_window = args.draft_window or (4096 if args.fast else 0)
         target_engine = LlamaPagedEngine(
@@ -855,6 +873,7 @@ def main():
             enable_cuda_graphs=True,    # draft uses CUDA graphs for q_len=1 steps
             kv_dtype=draft_kv,
             attn_window=draft_window,
+            window_ring=args.draft_ring and bool(draft_window),
         )
         spec_paged = SpeculativePagedEngine(
             target_engine, draft_engine,
@@ -865,9 +884,10 @@ def main():
         print(
             f"Spec+CUDA-graph decode enabled: {draft_config.name} draft, "
             f"{args.n_draft} tokens/step, "
-            f"draft KV={'int8' if draft_kv else 'bf16'}, "
+            f"draft KV={'int4' if args.draft_kv_int4 else ('int8' if draft_kv else 'bf16')}, "
             f"target KV={'int8' if target_kv else 'bf16'}, "
-            f"draft window={draft_window or 'full'}."
+            f"draft window={draft_window or 'full'}"
+            f"{' (ring pool)' if draft_engine.cache.window_ring else ''}."
         )
     elif draft_model is not None:
         spec_decoder = SpeculativeDecoder(draft=draft_model, target=model, n_draft=args.n_draft)

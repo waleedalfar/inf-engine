@@ -76,6 +76,7 @@ def _paged_flash_decode_kernel(
     PAGE: tl.constexpr,
     SINGLE_SPLIT: tl.constexpr,
     QUANT_KV: tl.constexpr,
+    PACK4: tl.constexpr,
     WINDOW: tl.constexpr,
     N_SINK: tl.constexpr,
 ):
@@ -139,13 +140,33 @@ def _paged_flash_decode_kernel(
         blk = tl.load(BlockTable + b * stride_bt_b + pos // PAGE,
                       mask=in_range, other=0)
         off = pos % PAGE
-        kv_off = (blk[:, None] * stride_kp_blk
-                  + h_kv * stride_kp_h
-                  + off[:, None] * stride_kp_pos
-                  + offs_d[None, :])
         kv_mask = in_range[:, None] & d_valid[None, :]
-        k = tl.load(KPool + kv_off, mask=kv_mask, other=0.0)
-        v = tl.load(VPool + kv_off, mask=kv_mask, other=0.0)
+        if PACK4:
+            # Two INT4 codes per byte: channel d lives in byte d//2 — low
+            # nibble for even d, high nibble for odd. Each byte is loaded once
+            # per nibble, so the *HBM* traffic is halved (the second read of a
+            # byte is an L1 hit) while every tile below keeps the exact shape
+            # the 8-bit path uses. Unpacking across lanes instead would need a
+            # reshape/split of the K tile and buys nothing off-chip.
+            kv_off = (blk[:, None] * stride_kp_blk
+                      + h_kv * stride_kp_h
+                      + off[:, None] * stride_kp_pos
+                      + (offs_d // 2)[None, :])
+            k_raw = tl.load(KPool + kv_off, mask=kv_mask, other=0).to(tl.int32) & 0xFF
+            v_raw = tl.load(VPool + kv_off, mask=kv_mask, other=0).to(tl.int32) & 0xFF
+            hi = ((offs_d % 2) == 1)[None, :]
+            k_nib = tl.where(hi, k_raw >> 4, k_raw) & 0xF
+            v_nib = tl.where(hi, v_raw >> 4, v_raw) & 0xF
+            # Sign-extend 4-bit two's complement: 0..7 stay, 8..15 -> -8..-1.
+            k = ((k_nib ^ 8) - 8).to(Q.dtype.element_ty)
+            v = ((v_nib ^ 8) - 8).to(Q.dtype.element_ty)
+        else:
+            kv_off = (blk[:, None] * stride_kp_blk
+                      + h_kv * stride_kp_h
+                      + off[:, None] * stride_kp_pos
+                      + offs_d[None, :])
+            k = tl.load(KPool + kv_off, mask=kv_mask, other=0.0)
+            v = tl.load(VPool + kv_off, mask=kv_mask, other=0.0)
 
         if QUANT_KV:
             # Per-(position, head) scales, so dequantization folds into work we
@@ -282,6 +303,7 @@ def paged_flash_attention(
     scratch: dict | None = None,
     window: int = 0,
     n_sink: int = 0,
+    pack4: bool = False,
 ) -> torch.Tensor:
     """GQA-native paged attention over a KV history held in physical blocks.
 
@@ -322,13 +344,21 @@ def paged_flash_attention(
                      (illegal memory access once the first engine was freed).
                      Pass the dict that lives alongside the graphs; allocation
                      then happens during warmup, outside any capture.
+        pack4:       The pools hold two INT4 codes per byte, so their last
+                     dimension is ``D // 2``. ``k_scale``/``v_scale`` are
+                     unchanged — still one scale per (block, head, position).
 
     Returns:
         ``(B, n_head, q_len, D)``, same dtype as ``q``.
     """
     B, n_head, q_len, D = q.shape
     n_blocks, n_kv, page, dk = k_pool.shape
-    assert dk == D, f"head_dim mismatch: q={D} pool={dk}"
+    if pack4:
+        assert k_pool.dtype is torch.int8, "pack4 pools are int8 byte-pairs"
+        assert D % 2 == 0, f"pack4 needs an even head_dim, got {D}"
+        assert dk == D // 2, f"packed head_dim mismatch: q={D} pool={dk} (want {D // 2})"
+    else:
+        assert dk == D, f"head_dim mismatch: q={D} pool={dk}"
     assert page == page_size, f"page_size={page_size} != pool page {page}"
     assert n_head % n_kv == 0, f"n_head={n_head} not divisible by n_kv={n_kv}"
     n_rep = n_head // n_kv
@@ -374,7 +404,7 @@ def paged_flash_attention(
         out.stride(0), out.stride(1), out.stride(2),
         q_len, n_rep, split_len, D,
         BLOCK_M=BLOCK_M, BLOCK_N=block_n, BLOCK_D=BLOCK_D, PAGE=page_size,
-        SINGLE_SPLIT=single, QUANT_KV=quant,
+        SINGLE_SPLIT=single, QUANT_KV=quant, PACK4=pack4,
         WINDOW=window, N_SINK=n_sink, num_warps=4, num_stages=2,
     )
     if single:
@@ -458,12 +488,97 @@ def _write_kv_quant_kernel(
     tl.store(VScale + s_at, vs)
 
 
+@triton.jit
+def _write_kv_int4_kernel(
+    KNew, VNew, KPool, VPool, KScale, VScale, BlockTable, SeqLens,
+    stride_kb, stride_kh, stride_kt,
+    stride_vb, stride_vh, stride_vt,
+    stride_pb, stride_ph, stride_pp,
+    stride_sb, stride_sh, stride_sp,
+    stride_bt_b,
+    half_dim,
+    PAGE: tl.constexpr,
+    BLOCK_D2: tl.constexpr,
+    QMAX: tl.constexpr,
+):
+    """One program per (sequence, kv_head, new token): quantize to INT4 and pack.
+
+    Kept separate from ``_write_kv_quant_kernel`` rather than folded in behind a
+    constexpr: the packed path works over ``head_dim // 2`` lanes and reads each
+    source vector as two strided halves, so almost none of the 8-bit kernel's
+    body survives the branch. A pair of small, separately readable kernels is
+    also what the V-through-K's-strides bug argues for — the stride plumbing is
+    the part that goes wrong, and here it is written out once per kernel.
+
+    Byte ``j`` holds channel ``2j`` in its low nibble and ``2j+1`` in its high
+    nibble, which is the layout ``_paged_flash_decode_kernel`` (PACK4) and
+    ``PagedLlamaKVCache._dequantize`` both unpack.
+    """
+    a = tl.program_id(0)
+    h = tl.program_id(1)
+    t = tl.program_id(2)
+
+    pos = tl.load(SeqLens + a) + t
+    blk = tl.load(BlockTable + a * stride_bt_b + pos // PAGE)
+    off = pos % PAGE
+
+    d2 = tl.arange(0, BLOCK_D2)
+    dm = d2 < half_dim
+    # K and V have independently derived layouts (K goes through QK-norm and
+    # RoPE, V does not), so their source strides are read separately.
+    k_base = a * stride_kb + h * stride_kh + t * stride_kt
+    v_base = a * stride_vb + h * stride_vh + t * stride_vt
+
+    # Even and odd channels of the same vector, so the amax below still spans
+    # the whole head_dim — the scale granularity is unchanged from INT8.
+    klo = tl.load(KNew + k_base + 2 * d2, mask=dm, other=0.0).to(tl.float32)
+    khi = tl.load(KNew + k_base + 2 * d2 + 1, mask=dm, other=0.0).to(tl.float32)
+    vlo = tl.load(VNew + v_base + 2 * d2, mask=dm, other=0.0).to(tl.float32)
+    vhi = tl.load(VNew + v_base + 2 * d2 + 1, mask=dm, other=0.0).to(tl.float32)
+
+    ks = tl.maximum(tl.maximum(tl.max(tl.abs(klo), axis=0),
+                               tl.max(tl.abs(khi), axis=0)) / QMAX, 1e-12)
+    vs = tl.maximum(tl.maximum(tl.max(tl.abs(vlo), axis=0),
+                               tl.max(tl.abs(vhi), axis=0)) / QMAX, 1e-12)
+
+    # Triton's float->int cast truncates; round half away from zero, then clamp
+    # so a boundary case cannot wrap into the wrong nibble.
+    klo_q = _round_clamp(klo / ks, QMAX)
+    khi_q = _round_clamp(khi / ks, QMAX)
+    vlo_q = _round_clamp(vlo / vs, QMAX)
+    vhi_q = _round_clamp(vhi / vs, QMAX)
+
+    # 4-bit two's complement in each nibble: -7 & 0xF == 9, which sign-extends
+    # back to -7 on the read side.
+    kp = (klo_q & 0xF) | ((khi_q & 0xF) << 4)
+    vp = (vlo_q & 0xF) | ((vhi_q & 0xF) << 4)
+    # 0..255 does not fit int8; wrap into -128..127 so the byte pattern is
+    # preserved and the read side's `& 0xFF` recovers it.
+    kp = tl.where(kp >= 128, kp - 256, kp)
+    vp = tl.where(vp >= 128, vp - 256, vp)
+
+    dst = blk * stride_pb + h * stride_ph + off * stride_pp + d2
+    s_at = blk * stride_sb + h * stride_sh + off * stride_sp
+
+    tl.store(KPool + dst, kp.to(KPool.dtype.element_ty), mask=dm)
+    tl.store(VPool + dst, vp.to(VPool.dtype.element_ty), mask=dm)
+    tl.store(KScale + s_at, ks)
+    tl.store(VScale + s_at, vs)
+
+
+@triton.jit
+def _round_clamp(x, QMAX: tl.constexpr):
+    """Round half away from zero, clamp to +/-QMAX, return int32 codes."""
+    r = tl.where(x >= 0, tl.floor(x + 0.5), tl.ceil(x - 0.5))
+    return tl.minimum(tl.maximum(r, -QMAX), QMAX).to(tl.int32)
+
+
 def write_kv_quant(
     k_new: torch.Tensor, v_new: torch.Tensor,
     k_pool: torch.Tensor, v_pool: torch.Tensor,
     k_scale: torch.Tensor, v_scale: torch.Tensor,
     block_table: torch.Tensor, seq_lens: torch.Tensor,
-    *, page_size: int, qmax: float, is_int: bool,
+    *, page_size: int, qmax: float, is_int: bool, pack4: bool = False,
 ) -> None:
     """Quantize ``k_new``/``v_new`` to 8-bit and scatter them into the pool.
 
@@ -476,10 +591,30 @@ def write_kv_quant(
         page_size: Tokens per physical block.
         qmax: Largest representable magnitude of the storage format.
         is_int: Round-to-nearest before storing (integer formats only).
+        pack4: Store two INT4 codes per byte; the pools' last dimension is
+            ``head_dim // 2``. ``qmax`` must be 7 and ``is_int`` True.
     """
     A, n_kv, q_len, D = k_new.shape
     assert k_new.stride(3) == 1 and v_new.stride(3) == 1, \
         "write_kv_quant requires head_dim to be the contiguous axis"
+    if pack4:
+        assert is_int and qmax == 7.0, f"pack4 expects INT4 (qmax=7), got {qmax}"
+        assert D % 2 == 0, f"pack4 needs an even head_dim, got {D}"
+        assert k_pool.shape[-1] == D // 2, \
+            f"packed pool last dim {k_pool.shape[-1]} != head_dim//2 {D // 2}"
+        half = D // 2
+        _write_kv_int4_kernel[(A, n_kv, q_len)](
+            k_new, v_new, k_pool, v_pool, k_scale, v_scale, block_table, seq_lens,
+            k_new.stride(0), k_new.stride(1), k_new.stride(2),
+            v_new.stride(0), v_new.stride(1), v_new.stride(2),
+            k_pool.stride(0), k_pool.stride(1), k_pool.stride(2),
+            k_scale.stride(0), k_scale.stride(1), k_scale.stride(2),
+            block_table.stride(0),
+            half,
+            PAGE=page_size, BLOCK_D2=max(16, triton.next_power_of_2(half)),
+            QMAX=qmax, num_warps=4,
+        )
+        return
     _write_kv_quant_kernel[(A, n_kv, q_len)](
         k_new, v_new, k_pool, v_pool, k_scale, v_scale, block_table, seq_lens,
         k_new.stride(0), k_new.stride(1), k_new.stride(2),

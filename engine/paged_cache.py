@@ -49,6 +49,14 @@ for _n in ("float8_e4m3fn", "float8_e4m3fnuz"):
     if hasattr(torch, _n):
         _QUANT_MAX[getattr(torch, _n)] = 448.0
 
+# torch has no int4 dtype, so INT4 storage is requested with this sentinel in
+# place of a ``torch.dtype``: the pool stays int8 but its last dimension is
+# head_dim/2, holding two 4-bit codes per byte (channel 2j in the low nibble,
+# 2j+1 in the high). Codes run -7..7 — symmetric, giving up the -8 slot so the
+# amax scaling stays the same one every other format here uses.
+INT4 = "int4"
+_INT4_QMAX = 7.0
+
 
 class BlockManager:
     """Pool of physical KV-cache blocks shared across all sequences."""
@@ -155,6 +163,13 @@ class PagedLlamaKVCache:
                 ``_QUANT_MAX``. Only the fused paged-attention path reads 8-bit
                 codes directly; the gather path dequantizes, so it stays correct
                 but gives the bandwidth back.
+
+                Pass the string ``INT4`` for two 4-bit codes per byte — a
+                further halving, on top of INT8, of both the pool and the read
+                traffic. Draft-side only: the target verifies every proposal, so
+                a coarser draft KV costs acceptance rate and never correctness.
+                On a *target* engine it changes the model's own distribution and
+                would need its own quality gate. See ``INT4`` for the layout.
             owned_layers: Contiguous layer range this cache stores, e.g.
                 ``range(4, 8)`` for a pipeline stage that only owns layers
                 4-7. Defaults to every layer (``range(config.n_layer)``,
@@ -170,12 +185,23 @@ class PagedLlamaKVCache:
         self.layer_offset = self.owned_layers.start
         n_total = manager.n_total
         bs = manager.block_size
-        shape = (len(self.owned_layers), n_total, config.n_kv_heads, bs, config.head_dim)
         self.dtype = dtype
-        self.kv_dtype = kv_dtype or dtype
-        self.quantized = self.kv_dtype in _QUANT_MAX
-        self.qmax = _QUANT_MAX.get(self.kv_dtype, 0.0)
-        self.is_int = self.kv_dtype is torch.int8
+        self.int4 = kv_dtype == INT4
+        if self.int4:
+            if config.head_dim % 2 != 0:
+                raise ValueError(f"INT4 KV needs an even head_dim, got {config.head_dim}")
+            self.kv_dtype = torch.int8
+            self.quantized = True
+            self.qmax = _INT4_QMAX
+            self.is_int = True
+        else:
+            self.kv_dtype = kv_dtype or dtype
+            self.quantized = self.kv_dtype in _QUANT_MAX
+            self.qmax = _QUANT_MAX.get(self.kv_dtype, 0.0)
+            self.is_int = self.kv_dtype is torch.int8
+        # Payload width: one byte per channel, or one byte per channel *pair*.
+        store_dim = config.head_dim // 2 if self.int4 else config.head_dim
+        shape = (len(self.owned_layers), n_total, config.n_kv_heads, bs, store_dim)
         self.k_pool = torch.zeros(shape, device=device, dtype=self.kv_dtype)
         self.v_pool = torch.zeros(shape, device=device, dtype=self.kv_dtype)
         if self.quantized:
@@ -411,7 +437,7 @@ class PagedLlamaKVCache:
                 self.k_pool[local_layer], self.v_pool[local_layer],
                 self.k_scale[local_layer], self.v_scale[local_layer],
                 bt, torch.tensor(write_bases, dtype=torch.long, device=k_new.device),
-                page_size=bs, qmax=self.qmax, is_int=self.is_int,
+                page_size=bs, qmax=self.qmax, is_int=self.is_int, pack4=self.int4,
             )
         else:
           for i, sid in enumerate(self._active):
@@ -582,7 +608,7 @@ class PagedLlamaKVCache:
                 self.k_pool[local_layer], self.v_pool[local_layer],
                 self.k_scale[local_layer], self.v_scale[local_layer],
                 block_table_buf, seq_lens_buf,
-                page_size=bs, qmax=self.qmax, is_int=self.is_int,
+                page_size=bs, qmax=self.qmax, is_int=self.is_int, pack4=self.int4,
             )
             return
         for q in range(k_new.shape[2]):
@@ -606,14 +632,33 @@ class PagedLlamaKVCache:
             ``(quantized, scale)`` with shapes (A, n_kv_heads, head_dim) and
             (A, n_kv_heads).
         """
+        if self.int4:
+            raise NotImplementedError(
+                "_quantize does not pack nibbles; INT4 writes go through "
+                "write_kv_quant(pack4=True)"
+            )
         scale = (x.abs().amax(dim=-1).float() / self.qmax).clamp(min=1e-12)
         q = x.float() / scale.unsqueeze(-1)
         if self.is_int:
             q = q.round().clamp(-self.qmax, self.qmax)
         return q.to(self.kv_dtype), scale
 
+    def _unpack_int4(self, x: torch.Tensor) -> torch.Tensor:
+        """Expand packed nibbles ``(..., head_dim//2)`` int8 to ``(..., head_dim)``.
+
+        Mirrors ``_write_kv_int4_kernel``'s layout: byte ``j`` holds channel
+        ``2j`` in its low nibble and ``2j+1`` in its high one, each a 4-bit
+        two's-complement code.
+        """
+        b = x.to(torch.int32) & 0xFF
+        lo = ((b & 0xF) ^ 8) - 8
+        hi = (((b >> 4) & 0xF) ^ 8) - 8
+        return torch.stack((lo, hi), dim=-1).flatten(-2)
+
     def _dequantize(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         """Undo ``_quantize`` for the gather path, which reads bf16."""
+        if self.int4:
+            x = self._unpack_int4(x)
         return (x.to(torch.float32) * scale.unsqueeze(-1)).to(self.dtype)
 
 
@@ -653,6 +698,7 @@ class PagedLlamaKVCache:
             v_scale=self.v_scale[local_layer] if self.quantized else None,
             n_splits=n_splits, scratch=self._attn_scratch,
             window=self.attn_window, n_sink=self.attn_sinks,
+            pack4=self.int4,
         )
 
     def extend_static(

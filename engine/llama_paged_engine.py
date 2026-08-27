@@ -15,6 +15,7 @@ Each iteration:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -50,6 +51,29 @@ def _splits_for(capture_len: int, batch: int, n_kv: int, target_ctas: int = 512)
     """
     base = max(1, target_ctas // max(batch * n_kv, 1))
     return max(1, min(base, max(1, capture_len // 128), 64))
+
+
+def ring_pool_blocks(window: int, sinks: int, prefill_chunk: int,
+                     block_size: int, margin: int = 16) -> int:
+    """Physical blocks a ``window_ring`` cache needs, independent of context length.
+
+    Steady state is ``sinks + window``: everything older has been recycled onto
+    the pinned sink block. The term that is easy to forget is the **prefill
+    chunk**. ``_prefill_forward`` calls ``ensure_slots_for(chunk)``, and
+    ``_grow_ring`` recycles against the length *before* that grow, so a whole
+    chunk's worth of blocks is appended before the next call can reclaim any.
+    Peak residency is therefore ``sinks + window + chunk``, not ``sinks +
+    window``, and sizing to the latter OOMs the pool partway through the first
+    long prefill instead of at construction.
+
+    At the shipped draft config (window 4096, chunk 2048, block_size 16) this is
+    401 blocks against 2048+ for a full 32k pool.
+    """
+    chunk = prefill_chunk or 0
+    return (math.ceil(sinks / block_size)
+            + math.ceil(window / block_size)
+            + math.ceil(chunk / block_size)
+            + margin)
 
 
 def _as_id_row(ids: list[int] | torch.Tensor, device: str) -> torch.Tensor:
@@ -209,7 +233,10 @@ class LlamaPagedEngine:
                          and the target's accept/reject still guarantees the
                          target's exact output distribution. On a target engine
                          it changes the model's own distribution, so gate it on
-                         a quality check.
+                         a quality check. ``engine.paged_cache.INT4`` (a string,
+                         since torch has no int4 dtype) packs two 4-bit codes
+                         per byte for another halving — draft-side only, same
+                         argument.
     """
 
     def __init__(
@@ -223,9 +250,10 @@ class LlamaPagedEngine:
         enable_cuda_graphs: bool = False,
         graph_batch_buckets: tuple[int, ...] | None = None,
         graph_len_buckets: list[int] | None = None,
-        kv_dtype: torch.dtype | None = None,
+        kv_dtype: "torch.dtype | str | None" = None,
         prefill_chunk: int = 2048,
         attn_window: int = 0,
+        attn_sinks: int = 4,
         window_ring: bool = False,
     ) -> None:
         self.model = model
@@ -234,9 +262,20 @@ class LlamaPagedEngine:
 
         self.prefill_chunk = prefill_chunk
         self.attn_window = attn_window
+        if window_ring and attn_window:
+            # The whole point of the ring: physical residency is bounded, so the
+            # pool must be *sized* to the bound or nothing is saved. Callers pass
+            # a full-context n_total_blocks (they cannot know this engine is
+            # windowed); shrink it here rather than making every call site
+            # recompute it.
+            n_total_blocks = min(
+                n_total_blocks,
+                ring_pool_blocks(attn_window, attn_sinks, prefill_chunk, block_size),
+            )
         self.manager = BlockManager(n_total_blocks, block_size)
         self.cache = PagedLlamaKVCache(model.config, self.manager, device, dtype,
                                        kv_dtype=kv_dtype, attn_window=attn_window,
+                                       attn_sinks=attn_sinks,
                                        window_ring=window_ring)
         self.cfg = sampling or SamplingConfig()
         self.eos = eos_token

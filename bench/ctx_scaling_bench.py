@@ -126,6 +126,20 @@ def main() -> None:
                          "term that dominates long context. Safe: the draft only "
                          "proposes; accept/reject still yields the target's exact "
                          "distribution.")
+    ap.add_argument("--draft-kv-int4", action="store_true",
+                    help="Store the draft's KV cache as packed INT4 nibbles — "
+                         "halves it again against --draft-kv-int8. Same safety "
+                         "argument: draft-side precision costs acceptance rate, "
+                         "never correctness. Overrides --draft-kv-int8. This is "
+                         "the lever for 64K, where the draft's INT8 KV is ~3.95 GB "
+                         "against the target's 5.0 and pushes the card past its "
+                         "16.3 GB.")
+    ap.add_argument("--draft-ring", action="store_true",
+                    help="Bound the draft's KV *pool* to its window instead of "
+                         "the full context (requires --draft-window). The draft "
+                         "already only reads its window; this stops it storing "
+                         "the rest. Costs no precision — unlike --draft-kv-int4, "
+                         "which is why this is the lever that works.")
     ap.add_argument("--draft-window", type=int, default=0,
                     help="Sliding-window attention for the DRAFT only (0 = full "
                          "context). The draft proposes and the target verifies, so "
@@ -156,8 +170,16 @@ def main() -> None:
     from engine.sampling import SamplingConfig, SamplingMode
     from engine.speculative_paged_engine import SpeculativePagedEngine
 
-    d_kv = torch.int8 if args.draft_kv_int8 else None
+    from engine.paged_cache import INT4
+
+    if args.draft_ring and not args.draft_window:
+        # The cache silently disables the ring without a window, which would hand
+        # back a full-pool run half an hour later looking like the ring did nothing.
+        ap.error("--draft-ring requires --draft-window (try 4096)")
+
+    d_kv = INT4 if args.draft_kv_int4 else (torch.int8 if args.draft_kv_int8 else None)
     t_kv = torch.int8 if args.target_kv_int8 else None
+    d_kv_name = "int4" if args.draft_kv_int4 else ("int8" if d_kv else "bf16")
 
     import dataclasses
 
@@ -188,8 +210,9 @@ def main() -> None:
     print(f"\ncorpus {corpus_digest} (acceptance is comparable across runs only "
           f"when this matches)")
     print(f"generating {N} tokens per point, "
-          f"draft KV={'int8' if d_kv else 'bf16'}, target KV={'int8' if t_kv else 'bf16'}, "
-          f"draft window={args.draft_window or 'full'}")
+          f"draft KV={d_kv_name}, target KV={'int8' if t_kv else 'bf16'}, "
+          f"draft window={args.draft_window or 'full'}"
+          f"{' (ring pool)' if args.draft_ring else ''}")
     total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     print(f"{'prompt':>8}{'end ctx':>9}{'K':>4}{'sl':>4}{'prefill ms':>12}{'decode ms/step':>16}"
           f"{'decode tok/s':>14}{'e2e tok/s':>11}{'accept':>8}{'tok/step':>10}"
@@ -216,7 +239,8 @@ def main() -> None:
             d = LlamaPagedEngine(draft, n_total_blocks=n_blocks, block_size=16,
                                  eos_token=None, sampling=greedy,
                                  enable_cuda_graphs=True, kv_dtype=d_kv,
-                                 attn_window=args.draft_window)
+                                 attn_window=args.draft_window,
+                                 window_ring=args.draft_ring)
             return SpeculativePagedEngine(t, d, n_draft=n_draft, eos_token=None)
 
         torch.cuda.empty_cache()
