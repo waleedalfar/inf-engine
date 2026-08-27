@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
 from engine.config import LlamaConfig
@@ -32,6 +33,13 @@ def _ring_cache(pool_blocks, block_size, window, sinks):
     )
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="A4 ring-buffer draft cache is not implemented yet — ensure_slot still "
+           "allocates a new physical block per position instead of recycling "
+           "out-of-window ones. strict=True so this fails loudly once A4 lands "
+           "and the test starts passing, rather than silently going green.",
+)
 def test_ring_residency_bounded_and_no_oom():
     bs, window, sinks = 4, 16, 4          # window = 4 blocks, sink = 1 block
     sink_blocks = math.ceil(sinks / bs)
