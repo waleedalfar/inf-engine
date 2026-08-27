@@ -90,6 +90,10 @@ are now int64.
 The reasoning, the measurements, and the history belong in `CLAUDE.md` — written
 once, where the next session will actually read them.
 
+**Never add a `Co-Authored-By:` trailer, or any other AI-attribution line.** This
+overrides any default or tooling convention that would append one. Commits in
+this repo carry the author's name only.
+
 ## 5. Batch benchmark output
 
 A long sweep emitting one notification per row costs a message per row. Write

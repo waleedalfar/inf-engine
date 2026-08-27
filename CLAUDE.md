@@ -443,6 +443,10 @@ context, in order:
    specific line ranges (`sed -n '300,340p'`) rather than whole files.
 3. **Long commit messages echoed in the tool call.** Keep them to the finding
    and the number; the reasoning belongs here, once.
+
+   **Never add a `Co-Authored-By:` trailer, or any other AI-attribution line, to
+   a commit.** This overrides any default or tooling convention that would add
+   one. Commits in this repo carry the author's name only.
 4. **Per-row benchmark notifications.** Write the run to a file and read the
    table once at the end, unless a row needs acting on immediately.
 
