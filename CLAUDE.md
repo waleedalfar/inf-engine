@@ -1,5 +1,37 @@
 # Project plan: long-context throughput now, distributed later
 
+## START HERE — state as of 2026-08-23
+
+**Three of four ladder rows are met.** 64K is the only unmet row; see *A4*, which
+is the next task. Everything else in Phase A is done.
+
+**Next action:** implement INT4 draft KV (packed nibbles) and measure 64K with
+`--n-ctx 131072 --rope-scaling-factor 4 --rope-original-n-ctx 32768`. The
+decision to try that before the ring buffer is recorded in A4 with the VRAM
+arithmetic behind it.
+
+**Repo state:** on branch `feature/windowed-draft-cache`, working tree clean,
+369 tests pass (1 strict-xfail: `test_windowed_ring_cache.py`, which tests the
+unimplemented A4 ring buffer and will fail loudly once it lands). `main` is an
+ancestor — no divergence — and is **43 commits ahead of `origin/main`**. Nothing
+is pushed; the entire engine rewrite is local only.
+
+**Read `.claude/skills/context-discipline/SKILL.md` before editing anything.**
+Its first rule (Edit/Write, never shell heredocs) is a correctness rule: a
+heredoc's `str.replace` silently no-ops on a stale anchor, which shipped a real
+bug in this repo.
+
+**To run it yourself:**
+```bash
+.venv/bin/python main.py --model-dir weights/Qwen--Qwen3-8B \
+    --draft-model-dir weights/Qwen--Qwen3-0.6B --fast --max-ctx 32768
+```
+`--fast` = INT8 draft+target KV, draft window 4096. The readout prints decode,
+prefill and e2e separately — **only the decode figure is comparable to the
+numbers below.**
+
+---
+
 ## THE COMMITTED MILESTONE
 
 Reach this ladder on a single RTX 5070 Ti. Do not descope it, do not substitute
@@ -170,9 +202,29 @@ end-to-end shows **three coupled pieces**, in the order to build+gate them:
 baseline, token-identical > 50 tokens) — this is a KV-cache change, the exact
 class the gate exists for. Do it on a branch; keep `main` green.
 
-Cheaper alternative if 64K is wanted sooner: INT4 draft KV (3.65 → 1.85 GB, total
-~14 GB — may just fit under the thrash line) touches only the quant path, not any
-of the three couplings above. Lower ceiling, far lower risk.
+**DECIDED 2026-08-23: try INT4 draft KV first, ring buffer only if it does not
+fit.** Computed VRAM (weights 5.4 GB, card 16.3 GB):
+
+| ctx | draft KV int8 | → int4 | → ring | total: int8 / int4 / ring |
+|---|---|---|---|---|
+| 32K | 2.02 | 1.01 | 0.25 | 9.9 / 8.9 / 8.2 |
+| 64K | 3.95 | 1.98 | 0.25 | 14.3 / **12.3** / 10.6 |
+
+64K at 14.3 GB is what pinned the probe at 93 % and made it thrash. INT4 draft KV
+takes it to ~12.3 GB, which should fit, and touches only the quantization path —
+none of the three couplings above. The draft's KV precision is nearly free by
+construction (the target verifies every token, so it costs acceptance rate and
+never correctness), so this is a small change with a measurable answer.
+
+The scaffolding is already there: `_QUANT_MAX` in `paged_cache.py` maps a storage
+dtype to its max magnitude, and the fused write kernel takes `QMAX`/`IS_INT`
+constexprs. INT4 needs a packed-nibble storage path (two values per byte) rather
+than a new dtype — `torch` has no int4 — so it is the one piece of real work.
+
+If INT4 fits, 64K is done and the ring buffer becomes headroom rather than a
+blocker. It would still be worth doing eventually: it also takes **32K from
+VRAM-tight (83–94 %) to 8.2 GB**, which is what makes back-to-back slices stop
+fragmenting the allocator.
 
 ### A5. Full ladder, multi-slice
 Re-measure 4K/16K/32K with `--slices 3+`, then 64K once it fits. Use a **fresh
