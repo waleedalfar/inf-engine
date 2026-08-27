@@ -159,3 +159,50 @@ def test_release_frees_blocks():
     eng.release()
     assert eng.target.cache.manager.n_free == free_before
     assert eng._resident is None
+
+
+def _ring_engine(cfg, tgt, dft, n_draft=3, window=32):
+    """Same pair, but the draft runs a windowed ring pool that recycles blocks."""
+    greedy = SamplingConfig(mode=SamplingMode.GREEDY)
+    t = LlamaPagedEngine(tgt, n_total_blocks=400, block_size=16,
+                         eos_token=None, sampling=greedy, enable_cuda_graphs=False)
+    d = LlamaPagedEngine(dft, n_total_blocks=400, block_size=16,
+                         eos_token=None, sampling=greedy, enable_cuda_graphs=False,
+                         attn_window=window, attn_sinks=4, window_ring=True,
+                         prefill_chunk=64)
+    assert d.cache.window_ring and d.manager.n_total < 400   # pool really shrank
+    return SpeculativePagedEngine(t, d, n_draft=n_draft, eos_token=None)
+
+
+def test_reuse_matches_cold_engine_with_a_recycling_draft_cache():
+    """Cross-turn reuse against a ring draft cache.
+
+    The interaction worth pinning: `generate_resident` rolls both caches back and
+    continues, while the ring has already recycled the draft's out-of-window
+    blocks and repointed those entries at the pinned sink block. Rollback must not
+    resurrect a position whose physical block is gone, and must not double-free
+    an aliased entry. Both engines here are windowed, so a mismatch is the ring's
+    bookkeeping and not the window's effect on what the draft proposes.
+    """
+    cfg = _config()
+    tgt, dft = _model(cfg, 1), _model(cfg, 2)
+    torch.manual_seed(0)
+    base = torch.randint(0, cfg.vocab_size, (150,)).tolist()
+
+    eng = _ring_engine(cfg, tgt, dft)
+    convo = list(base)
+    for turn in range(3):
+        req = LlamaRequest(req_id=turn, prompt_ids=list(convo), max_new_tokens=10)
+        got, _ = eng.generate_resident(req)
+
+        cold = _ring_engine(cfg, tgt, dft)
+        want = cold._generate_one(
+            LlamaRequest(req_id=0, prompt_ids=list(convo), max_new_tokens=10))[0]
+
+        assert got == want, f"turn {turn} diverged\n  reuse: {got}\n  cold:  {want}"
+        convo = convo + got + [7, 8, 9]
+    eng.release()
+    # No block leaked or got freed twice across the whole conversation.
+    free = eng.draft.manager._free
+    assert len(free) == len(set(free))
+    assert eng.draft.manager.n_free == eng.draft.manager.n_total

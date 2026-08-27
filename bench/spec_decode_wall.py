@@ -22,6 +22,11 @@ def main() -> None:
     ap.add_argument("--ctx", type=int, default=32000)
     ap.add_argument("--n-draft", type=int, default=4)
     ap.add_argument("--draft-window", type=int, default=4096)
+    ap.add_argument("--draft-ring", action="store_true",
+                    help="Bound the draft's KV pool to its window. Here so the "
+                         "ring can be cross-checked against ctx_scaling_bench "
+                         "with a decode-only wall, rather than trusted from one "
+                         "harness.")
     ap.add_argument("--max-new-tokens", type=int, default=200)
     args = ap.parse_args()
 
@@ -52,7 +57,8 @@ def main() -> None:
     d = LlamaPagedEngine(draft_m, n_total_blocks=n_blocks, block_size=16,
                          eos_token=None, sampling=greedy,
                          enable_cuda_graphs=True, kv_dtype=torch.int8,
-                         attn_window=args.draft_window)
+                         attn_window=args.draft_window,
+                         window_ring=args.draft_ring)
     eng = SpeculativePagedEngine(t, d, n_draft=args.n_draft, eos_token=None)
 
     # Warm up graph capture.
