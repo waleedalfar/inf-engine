@@ -1,52 +1,87 @@
 # Project plan: long-context throughput now, distributed later
 
-## START HERE — state as of 2026-08-23
+## START HERE — state as of 2026-08-27
 
-**Three of four ladder rows are met.** 64K is the only unmet row; see *A4*, which
-is the next task. Everything else in Phase A is done.
+**The ladder is met and Phase A is done.** 4K, 16K and 32K all pass, and 32K is
+now VRAM-robust rather than VRAM-tight. **64K was formally dropped from the
+milestone on 2026-08-27** by the project owner, on the evidence in *A4* — it is
+not a pending task and should not be reinstated without new information.
 
-**Next action:** implement INT4 draft KV (packed nibbles) and measure 64K with
-`--n-ctx 131072 --rope-scaling-factor 4 --rope-original-n-ctx 32768`. The
-decision to try that before the ring buffer is recorded in A4 with the VRAM
-arithmetic behind it.
+**What changed this session:**
 
-**The ring buffer is NOT started.** No implementation exists — only
-`tests/test_windowed_ring_cache.py`, which was written ahead of the feature and
-is marked strict-xfail. Its one failing case (`ensure_slot` still allocates a new
-physical block per position instead of recycling out-of-window ones) is the
-feature's entry point, not a regression. Nothing in `paged_cache.py` recycles
-blocks yet.
+1. **INT4 draft KV: built, gated, REJECTED on measurement.** Correct but
+   unusable — it takes the draft's top-1 to 2.17 % and acceptance to 1.3 %. It
+   is a property of the format, not a bug, and no grouping fixes it. The code is
+   kept and off by default. **Do not retry this.** A4 has the numbers.
+2. **Ring-buffer draft cache: landed and measured.** `--draft-ring` bounds the
+   draft's KV *pool* to its attention window. 32K peak VRAM stops accumulating
+   across slices (12.0→16.1 GB becomes flat 10.5→11.3 GB) and the third slice
+   no longer thrashes (79.6 → 33.3 ms/step, prefill 121 s → 26 s).
 
-**Repo state:** on branch `feature/windowed-draft-cache`, working tree clean,
-369 tests pass (1 strict-xfail, above). `main` is an ancestor — no divergence.
+**Next action — pick one, nothing is blocking:**
+
+- **A5**: re-measure 4K/16K with `--slices 3 --draft-ring` now that the ring
+  exists. Only 32K has been measured with it.
+- Decide whether `--fast` should imply `--draft-ring`. It currently does **not**,
+  deliberately: `--fast` is documented as the fastest *measured* config, and the
+  ring buys robustness, not decode speed (it costs ~11 % on prefill). The case
+  for folding it in is that on a 16 GB card the ring is what keeps long context
+  from degenerating on the second or third turn.
+- **Phase B (distributed)** — the ladder no longer blocks it at all. Its known
+  gaps (B1–B4) are already written up below.
+
+**Do not re-derive these; they are settled and written up in A4:** INT4 KV is
+dead for this draft; the ring's `_grow_ring` one-block slack is deliberate and
+load-bearing; the ring pool must be sized `sinks + window + prefill_chunk`.
+
+**Repo state:** branch `main`, 382 tests pass (10 skipped), no xfail. **Working tree is dirty
+— this session's work is uncommitted.** `feature/windowed-draft-cache` is
+*behind* main, not ahead — ignore it.
 
 **Read `.claude/skills/context-discipline/SKILL.md` before editing anything.**
 Its first rule (Edit/Write, never shell heredocs) is a correctness rule: a
 heredoc's `str.replace` silently no-ops on a stale anchor, which shipped a real
 bug in this repo.
 
-**To run it yourself:**
+**To run it yourself (agentic, 32K):**
 ```bash
 .venv/bin/python main.py --model-dir weights/Qwen--Qwen3-8B \
-    --draft-model-dir weights/Qwen--Qwen3-0.6B --fast --max-ctx 32768
+    --draft-model-dir weights/Qwen--Qwen3-0.6B \
+    --fast --draft-ring --max-ctx 32768 --max-turns 12 --workspace .
 ```
-`--fast` = INT8 draft+target KV, draft window 4096. The readout prints decode,
-prefill and e2e separately — **only the decode figure is comparable to the
-numbers below.**
+`--fast` = INT8 draft+target KV, draft window 4096. `--draft-ring` adds the
+bounded draft pool; the banner must say `draft window=4096 (ring pool)` or it did
+not engage (it needs `--draft-window`, which `--fast` supplies). Tools available
+to the model: `read_file`, `write_file`, `list_dir`, `search_files`, `run_shell`,
+`run_python`, all sandboxed to `--workspace`. The readout prints decode, prefill
+and e2e separately — **only the decode figure is comparable to the numbers
+below.**
 
 ---
 
 ## THE COMMITTED MILESTONE
 
 Reach this ladder on a single RTX 5070 Ti. Do not descope it, do not substitute
-an easier target, and do not stop at the rows that already pass.
+an easier target, and do not stop at the rows that already pass. **The ladder is
+now the three rows below; 64K was formally dropped on 2026-08-27 (see under the
+table). That decision is made — do not re-add the row, and do not read the rule
+above as licence to drop another one.**
 
 | context | committed tok/s | measured decode (clean run) | status |
 |---|---|---|---|
 | ~4K  | **90–120+** | 124–131  (23.9–24.4 ms/step) | ✅ **above band** |
 | ~16K | **80–90**   | 85–128   (27–30 ms/step)     | ✅ **met** |
-| ~32K | **55–65**   | 91–99    (26.5–28.8 ms/step) | ✅ **met, VRAM-tight** |
-| ~64K | **40–42**   | —                             | ⛔ not attempted |
+| ~32K | **55–65**   | 92–111   (27.9–33.3 ms/step) | ✅ **met, VRAM-robust** |
+
+**The ladder is met. Phase A is done.**
+
+**64K — DROPPED 2026-08-27 by the project owner.** Not "deferred", not
+"blocked": removed from the milestone. Read *A4* before proposing it back. Two
+points in particular: 64K was never a throughput problem (extrapolating the
+monotone ms/step curve puts it near 32–35 ms/step, comfortably inside its old
+40–42 tok/s band), and the best case after every available VRAM lever was ~83 %
+of the card — exactly the tightness 32K used to misbehave at. Dropped on
+evidence, not on difficulty.
 
 Best config: INT8 draft + target KV, split-K INT4 matmul, **draft attention
 window 4096 with 4 sink tokens**, n_draft=4.
@@ -65,10 +100,23 @@ benchmark now stamps the decode start inside the run instead of subtracting a
 separate estimate. tok/s within a row still tracks acceptance (content), so the
 range is acceptance spread, not timing noise.
 
-**32K is met but sits at 83–94 % VRAM.** A clean single run decodes at ~28 ms/step;
-back-to-back slices fragment the allocator and the second slice thrashed to
-141 ms/step at 94 %. The throughput is there; the memory headroom is the real
-remaining constraint at long context, and it is what blocks 64K.
+**32K's VRAM headroom is FIXED (2026-08-27) by the ring-buffer draft cache.**
+It used to sit at 83–94 % and the third back-to-back slice collapsed. Measured
+`--slices 3` at 32K, same session, ring off vs on:
+
+| slice | prefill ms | ms/step | accept | peak GB |
+|---|---|---|---|---|
+| off 0 / 1 / 2 | 23 788 / 24 104 / **120 980** | 30.6 / 33.9 / **79.6** | 66.8 / 82.9 / 82.7 % | 12.0 / 14.1 / **16.1** |
+| on  0 / 1 / 2 | 26 420 / 27 090 / **26 290** | 27.9 / 32.8 / **33.3** | 66.1 / 82.9 / 86.2 % | 10.5 / 10.9 / **11.3** |
+
+**Peak VRAM stops accumulating** — flat 10.5→11.3 GB instead of climbing 12.0→16.1
+(98.8 % of the card). Slice 2's prefill goes 121 s → 26 s and its ms/step 79.6 →
+33.3. On the *healthy* slices ms/step is unchanged within the 7.1 % noise floor
+(30.6→27.9, 33.9→32.8), so this bought robustness, not speed. Acceptance is
+neutral (−0.7 / 0 / +3.5 points); the shifts are real, not noise, because ring
+mode also makes the draft's *prefill* windowed, which changes its proposals.
+The one cost is **prefill ~11 % slower on healthy slices** (bookkeeping plus the
+windowed prefill mask) — worth it against a 4.6× win on the slice that thrashed.
 
 Qwen3-8B INT4 target + Qwen3-0.6B draft, INT8 draft KV, n_draft=4.
 16 GB VRAM, 896 GB/s.
@@ -161,7 +209,10 @@ slice-0), 32K decodes at 26.5–28.8 ms/step = 91–99 tok/s, above the 55–65 
 The "~38 ms unexplained" was the misattributed prefill. Benchmark fixed; see the
 milestone note above. What remains at 32K is **VRAM headroom**, not throughput.
 
-### A4. 64K enablement — NEXT, and now the only unmet row
+### A4. 64K enablement — ✅ CLOSED (row dropped 2026-08-27; ring buffer landed)
+
+*Kept in full because it is the evidence for dropping 64K and for never retrying
+INT4 KV. The ring-buffer work it scoped did land, and fixed 32K.*
 YaRN is implemented and wired into the bench (`--n-ctx 131072 --rope-scaling-factor
 4 --rope-original-n-ctx 32768`). **Measured: 64K does not fit.** A probe pinned the
 GPU at 93 % VRAM (15.2 / 16.3 GB), 100 % util, grinding — it thrashes before it's
@@ -206,34 +257,114 @@ end-to-end shows **three coupled pieces**, in the order to build+gate them:
 baseline, token-identical > 50 tokens) — this is a KV-cache change, the exact
 class the gate exists for. Do it on a branch; keep `main` green.
 
-**DECIDED 2026-08-23: try INT4 draft KV first, ring buffer only if it does not
-fit.** Computed VRAM (weights 5.4 GB, card 16.3 GB):
+**INT4 draft KV: built, gated, and REJECTED on measurement (2026-08-27).**
 
-| ctx | draft KV int8 | → int4 | → ring | total: int8 / int4 / ring |
-|---|---|---|---|---|
-| 32K | 2.02 | 1.01 | 0.25 | 9.9 / 8.9 / 8.2 |
-| 64K | 3.95 | 1.98 | 0.25 | 14.3 / **12.3** / 10.6 |
+The 2026-08-23 decision was to try INT4 draft KV before the ring buffer, on the
+reasoning that "the draft's KV precision is nearly free by construction — the
+target verifies every token, so it costs acceptance rate and never correctness."
+**The first half is true and the second half is the trap.** It costs acceptance
+rate, and it costs essentially *all* of it.
 
-64K at 14.3 GB is what pinned the probe at 93 % and made it thrash. INT4 draft KV
-takes it to ~12.3 GB, which should fit, and touches only the quantization path —
-none of the three couplings above. The draft's KV precision is nearly free by
-construction (the target verifies every token, so it costs acceptance rate and
-never correctness), so this is a small change with a measurable answer.
+Implemented as packed nibbles (`INT4` sentinel in `paged_cache.py`, the pool
+stays int8 with last dim `head_dim/2`; `_write_kv_int4_kernel` packs, the
+`PACK4` branch of `_paged_flash_decode_kernel` unpacks; `--draft-kv-int4` on the
+bench and `main.py`). Measured on Qwen3-8B + Qwen3-0.6B, 4096 ctx, greedy:
 
-The scaffolding is already there: `_QUANT_MAX` in `paged_cache.py` maps a storage
-dtype to its max magnitude, and the fused write kernel takes `QMAX`/`IS_INT`
-constexprs. INT4 needs a packed-nibble storage path (two values per byte) rather
-than a new dtype — `torch` has no int4 — so it is the one piece of real work.
+| draft KV | greedy output vs baseline | acceptance | tok/step |
+|---|---|---|---|
+| int8 | token-identical | **71.8 %** | 2.89 |
+| int4 | token-identical | **1.3 %** | 1.01 |
 
-If INT4 fits, 64K is done and the ring buffer becomes headroom rather than a
-blocker. It would still be worth doing eventually: it also takes **32K from
-VRAM-tight (83–94 %) to 8.2 GB**, which is what makes back-to-back slices stop
-fragmenting the allocator.
+The correctness gate *passes* — speculative decoding is exact no matter how bad
+the draft is — and that is exactly why the gate could not catch this. tok/step
+1.01 means four draft forwards and a verify per emitted token: strictly worse
+than not speculating.
+
+**It is the format, not the kernel.** Measured through the draft's own
+teacher-forced logits, with no speculative machinery in the path (4096 tokens,
+bf16 weights, KV format the only variable):
+
+| draft KV | ppl | top-1 vs bf16 |
+|---|---|---|
+| bf16 | 16.19 | — |
+| int8 | 16.57 | 90.13 % |
+| int4 | 265 335 | **2.17 %** |
+
+2.17 % top-1 predicts the 1.3 % acceptance directly — the draft proposes its
+argmax and the target accepts it only when it agrees. The kernel itself is
+unit-tested against a torch reference at head_dim 64 *and* 128
+(`tests/test_int4_kv.py`): round-trip within one quantization step, and the read
+kernel agreeing with the independent torch gather path.
+
+**No amount of finer scaling rescues it.** Relative RMS error on gaussian K/V by
+group size (measured), against the byte cost per 128 channels:
+
+| group | int8 err | int4 err | int4 bytes/128ch |
+|---|---|---|---|
+| 128 (shipped granularity) | 0.65 % | **11.7 %** | 68 |
+| 32 | 0.53 % | 9.7 % | 80 |
+| 8 | 0.40 % | 7.2 % | 128 |
+| 4 | 0.31 % | 5.6 % | 192 |
+
+INT8 at 0.65 % gives 90 % top-1. FP8 at 2.6 % gave 0.2 % top-1 on this same
+28-layer draft (see `_QUANT_MAX`). **The cliff sits under ~2 %, and INT4's floor
+is 5.6 % even at group=4 — which costs 192 bytes, more than INT8's 132.** Four
+bits over an amax-scaled range is ~amax/7 per step, so the RMS error cannot go
+below roughly σ/15 regardless of grouping. There is no INT4 configuration that
+is both smaller than INT8 and accurate enough for this draft. Dead end; don't
+re-derive it.
+
+The code is kept — it is correct, tested, and costs nothing switched off — but
+**do not enable `--draft-kv-int4`.**
+
+**Ring-buffer draft cache — ✅ DONE (2026-08-27), and it is what fixed 32K.**
+`--draft-ring` (bench, `main.py`, `spec_decode_wall.py`) bounds the draft's KV
+*pool*, not just its reads. Unlike INT4 it costs no draft precision by
+construction: the draft already only reads its 4096-token window, so bounding
+what it *stores* to that window changes nothing it computes. Measured 32K draft
+pool 2157 blocks / 1.98 GB → **401 blocks / 0.37 GB**; the slice table in the
+milestone section has the throughput and peak-VRAM effect.
+
+Three things about it that are settled and should not be re-litigated:
+
+- **`_grow_ring`'s one-block slack is deliberate.** It recycles against the
+  length *before* a grow, because the first query of a multi-token grow (a
+  2048-token prefill chunk) still attends back to `seq_lens - window + 1`.
+  `tests/test_windowed_ring_cache.py` used to assert the tightest possible bound
+  and was marked strict-xfail against it; the *test* was wrong, and asserting
+  that bound would have been asserting a bug. It now allows one block of slack
+  and separately checks that recycling actually happens.
+- **Pool size is `sinks + window + prefill_chunk`, not `sinks + window`**
+  (`ring_pool_blocks` in `llama_paged_engine.py`). `_prefill_forward` grows a
+  whole chunk at a time and nothing can be reclaimed until the next call, so
+  omitting the chunk term survives construction and then OOMs partway through
+  the first long prefill. 401 blocks at the shipped config.
+- **Cross-turn prefix reuse works with it** (`tests/test_prefix_reuse.py`):
+  rollback never resurrects a recycled position or double-frees an alias.
+
+**64K — DROPPED 2026-08-27 by the project owner.** Removed from the milestone,
+not parked. This section is the evidence behind that call. What was measured:
+with INT4 draft KV
+the 64K run sat at **15.3 GB / 94 %** at 99 % util and never emerged from
+prefill — the same signature as the earlier INT8 probe at 93 %. The ring is worth
+~1.7 GB more than INT4 on the draft pool, which would put 64K near 13.6 GB ≈
+83 % — i.e. exactly the tightness 32K used to have and misbehave at. That is a
+thin margin to build on.
+
+Two caveats recorded so nobody re-derives them: (1) the ~2.8 GB gap between the
+predicted 12.5 GB and the observed 15.3 GB was never traced — presumably prefill
+activations plus fragmentation, and some of it may be addressable independently
+of the draft KV, so 64K is *not proven impossible*. (2) **64K was never a
+throughput problem.** Extrapolating the monotone ms/step curve (24 → 27 → 28.8 at
+4/16/32K) puts 64K near 32–35 ms/step, comfortably above its 40–42 tok/s band.
+It is a memory problem end to end; do not chase it as a speed one.
 
 ### A5. Full ladder, multi-slice
-Re-measure 4K/16K/32K with `--slices 3+`, then 64K once it fits. Use a **fresh
-engine per slice** or the allocator fragments and the later slices read as
-thrash (seen at 32K slice 1). One slice is one sample; the spread is the result.
+32K is done with `--slices 3`, both with and without the ring (milestone
+section). **4K and 16K have not been re-measured with `--draft-ring`.** Use a
+**fresh engine per slice** or the allocator fragments and the later slices read
+as thrash — this is exactly what ring-off slice 2 shows above. One slice is one
+sample; the spread is the result.
 
 ---
 
@@ -330,6 +461,8 @@ Draft attention row reflects full-context draft; with window=4096 (A6) this cost
 | YaRN RoPE scaling | `engine/layers.py` | makes >32768 context possible |
 | Context-dependent `n_draft` | `SpeculativePagedEngine` | mechanism only; curve unmeasured |
 | Sliding-window draft attention | `engine/kernels/paged_attention.py`, `SpeculativePagedEngine` | draft KV traffic cut ~10× at 32K; met 16K target |
+| INT4 packed-nibble KV | `engine/paged_cache.py` (`INT4`), `paged_attention.py` | halves the pool again — **but unusable, see A4. Off by default.** |
+| Ring-buffer draft KV pool | `paged_cache.py:_grow_ring`, `ring_pool_blocks` | 32K draft pool 1.98 → 0.37 GB; peak stops accumulating across slices |
 
 **Use INT8, not FP8, for KV.** Both are one byte, but per-token amax scaling
 already supplies the exponent range FP8 spends bits on, so e4m3's 3 mantissa bits
@@ -350,6 +483,15 @@ cache, or graph capture: diff greedy speculative output against greedy baseline
 on a **real** model over >50 tokens — they must be token-identical — and check
 the single-model baseline too. An int32 overflow in the INT4 matmul was found
 only because the baseline was diffed alongside speculative decode.
+
+**A passing correctness gate can hide a total collapse — on the draft side it is
+structurally blind.** Speculative decoding is exact for *any* draft, so the
+greedy-identity gate returns "token-identical" whether the draft is excellent or
+outputting noise. INT4 draft KV passed it while acceptance sat at 1.3 %. Any
+change to the draft — its KV format, its window, its weights — must be gated on
+**acceptance rate**, measured against the same prompt with the change off. Pair
+the identity gate with an acceptance number or you have checked nothing about
+whether the change was worth making.
 
 **Cold-cache microbenchmarks only.** Re-timing one weight tensor reads L2 (64 MB
 on GB203), not HBM. A hot sweep predicted 1.16× and delivered ~0 in-graph.
@@ -426,6 +568,21 @@ Keep this current. One line per landed change, newest last.
   --rope-original-n-ctx`). 64K thrashes at 93 % VRAM; measured the block is the draft's
   unbounded KV (~3.65 GB, never-read past its 4096 window). Fix scoped: ring-buffer
   windowed draft cache. Not yet implemented.
+- 2026-08-27 — A4: INT4 packed-nibble draft KV built and **rejected on measurement**.
+  Correct (greedy output token-identical, kernel unit-tested at head_dim 64/128) but
+  the draft's own top-1 falls to 2.17 %, taking acceptance 71.8 % → 1.3 % and tok/step
+  to 1.01. INT4's error floor is 5.6 % against a cliff under 2 %; no grouping fixes it.
+  Code kept and off by default. Ring buffer is the path to 64K.
+- 2026-08-27 — Corrected START HERE: the ring buffer was recorded as unstarted but
+  pieces 1 and 2 are implemented in `paged_cache.py` / `llama_paged_engine.py`. What
+  is missing is the draft pool sizing, a CLI flag, and an end-to-end gate.
+- 2026-08-27 — Ring-buffer draft cache finished and measured (`--draft-ring`):
+  `ring_pool_blocks` sizing (sinks+window+chunk), fixed the over-tight xfail test,
+  prefix-reuse coverage. **32K 3-slice peak VRAM flat 10.5–11.3 GB instead of
+  climbing 12.0→16.1; slice 2 prefill 121 s → 26 s, 79.6 → 33.3 ms/step.**
+  Acceptance neutral, decode ms/step unchanged within noise on healthy slices.
+- 2026-08-27 — 64K formally dropped from the milestone by the project owner on VRAM
+  evidence (see A4). Ladder is now 4K/16K/32K, all met; Phase A done.
 
 ---
 
@@ -457,10 +614,11 @@ log, and whichever plan item is in flight — then stop.
 ## Commands
 
 ```bash
-# the goal
+# the goal (add --draft-ring for bounded draft-KV residency; needs --draft-window)
 .venv/bin/python -m bench.ctx_scaling_bench \
     --model-dir weights/Qwen--Qwen3-8B --draft-model-dir weights/Qwen--Qwen3-0.6B \
-    --draft-kv-int8 --lengths 4096 16384 32000 --slices 3
+    --draft-kv-int8 --target-kv-int8 --draft-window 4096 --draft-ring \
+    --lengths 4096 16384 32000 --slices 3
 
 .venv/bin/pytest -q
 ```
