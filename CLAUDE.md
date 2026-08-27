@@ -10,11 +10,15 @@ is the next task. Everything else in Phase A is done.
 decision to try that before the ring buffer is recorded in A4 with the VRAM
 arithmetic behind it.
 
+**The ring buffer is NOT started.** No implementation exists — only
+`tests/test_windowed_ring_cache.py`, which was written ahead of the feature and
+is marked strict-xfail. Its one failing case (`ensure_slot` still allocates a new
+physical block per position instead of recycling out-of-window ones) is the
+feature's entry point, not a regression. Nothing in `paged_cache.py` recycles
+blocks yet.
+
 **Repo state:** on branch `feature/windowed-draft-cache`, working tree clean,
-369 tests pass (1 strict-xfail: `test_windowed_ring_cache.py`, which tests the
-unimplemented A4 ring buffer and will fail loudly once it lands). `main` is an
-ancestor — no divergence — and is **43 commits ahead of `origin/main`**. Nothing
-is pushed; the entire engine rewrite is local only.
+369 tests pass (1 strict-xfail, above). `main` is an ancestor — no divergence.
 
 **Read `.claude/skills/context-discipline/SKILL.md` before editing anything.**
 Its first rule (Edit/Write, never shell heredocs) is a correctness rule: a
