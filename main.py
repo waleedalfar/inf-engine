@@ -453,8 +453,12 @@ class SpeculativeGraphedAgentLoop(VerboseAgentLoop):
         print("Agent: ", end="", flush=True)
         t0 = time.perf_counter()
 
-        results, stats = self.engine.run_offline([req])
-        gen_ids = results[req.req_id]
+        # Reuse the KV already held for this conversation's prefix. A chat turn's
+        # prompt is the previous turn's prompt plus its answer plus the new
+        # message, so re-prefilling all of it every turn was the dominant
+        # interactive cost — 4.4 s to re-read 7152 tokens before emitting one new
+        # token, against 27 ms/step of decode.
+        gen_ids, stats = self.engine.generate_resident(req)
 
         elapsed = time.perf_counter() - t0
         n_gen = len(gen_ids)
@@ -913,6 +917,12 @@ def main():
 
             if user_input == "/clear":
                 messages = [messages[0]]  # keep system prompt
+                # Drop any KV held for the old conversation. The prefix-reuse
+                # path would detect the mismatch and fall back anyway, but
+                # holding those blocks until then wastes the pool.
+                release = getattr(getattr(agent, "engine", None), "release", None)
+                if release is not None:
+                    release()
                 print("Conversation cleared.\n")
                 continue
 

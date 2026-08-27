@@ -32,6 +32,7 @@ import torch
 
 from engine.llama_paged_engine import LlamaPagedEngine, LlamaRequest
 from engine.sampling import SamplingConfig, SamplingMode, _apply_repetition_penalty
+from engine.sampling import sample_next_token
 from engine.speculative import SpecStats, _correction_sample, _sample_from_probs
 
 
@@ -69,6 +70,10 @@ class SpeculativePagedEngine:
                   ``max_new_tokens`` is used as a stopping criterion.
     """
 
+    # Below this many shared tokens, rolling back and re-prefilling the suffix
+    # costs more bookkeeping than it saves.
+    MIN_REUSE_TOKENS = 64
+
     def __init__(
         self,
         target: LlamaPagedEngine,
@@ -81,6 +86,9 @@ class SpeculativePagedEngine:
         self.n_draft = n_draft
         self.max_n_draft = n_draft if isinstance(n_draft, int) else 16
         self.eos = eos_token
+        # Cross-turn prefix reuse: the sequences and the exact token history
+        # currently held in both KV caches. None when nothing is resident.
+        self._resident: dict | None = None
 
     # ------------------------------------------------------------------
     # Public interface
@@ -103,6 +111,92 @@ class SpeculativePagedEngine:
             combined.decode_s += stats.decode_s
         return results, combined
 
+    def generate_resident(self, req: LlamaRequest) -> tuple[list[int], SpecStats]:
+        """Generate, reusing whatever prefix of ``req.prompt_ids`` is already cached.
+
+        A chat turn's prompt is the previous turn's prompt plus its answer plus
+        the new message — strictly append-only. Re-prefilling all of it every
+        turn is the dominant interactive cost: measured 4430 ms to re-read 7152
+        tokens before emitting a single new one, against 27 ms/step of decode.
+
+        Keeps both sequences alive between calls, rolls the caches back to the
+        longest common prefix, and prefills only what is new. Falls back to a
+        clean full prefill whenever the prefix does not match — a different
+        conversation, an edited history, or a cache that was dropped.
+
+        The caller owns the lifetime: call ``release()`` when the session ends.
+        """
+        target, draft = self.target, self.draft
+        res = self._resident
+        if res is None:
+            return self._generate_one(req, keep_resident=True)
+
+        shared = _common_prefix_len(res["tokens"], req.prompt_ids)
+        # Both caches hold every resident token except the last, which is still
+        # pending in _active. Never reuse the whole new prompt: at least one
+        # token must go through the model to produce logits.
+        cached = min(
+            shared, res["cached"], len(req.prompt_ids) - 1,
+            target.cache.seq_lens.get(t_sid_peek := res["t_sid"], 0),
+            draft.cache.seq_lens.get(res["d_sid"], 0),
+        )
+        if cached < self.MIN_REUSE_TOKENS:
+            self.release()
+            return self._generate_one(req, keep_resident=True)
+
+        t_sid, d_sid = res["t_sid"], res["d_sid"]
+        now = time.perf_counter()
+        target.cache.reset_to(t_sid, cached)
+        draft.cache.reset_to(d_sid, cached)
+
+        suffix = req.prompt_ids[cached:]
+        logits = target._prefill_forward(t_sid, suffix, base=cached)
+        draft._prefill_forward(d_sid, suffix, base=cached)
+
+        first = sample_next_token(logits[:, -1, :], target.cfg)      # (1, 1)
+        req.generated.append(int(first))
+        req.start_time = now
+
+        first_t = first.view(1).to(target.device)
+        draft_req = LlamaRequest(req_id=-1, prompt_ids=req.prompt_ids,
+                                 max_new_tokens=req.max_new_tokens)
+        target._active[t_sid] = (req, first_t)
+        draft._active[d_sid] = (draft_req, first_t.to(draft.device))
+        target._generated[t_sid] = [int(first)]
+        target.cache.ensure_slot(t_sid)
+        draft.cache.ensure_slot(d_sid)
+
+        if len(req.generated) >= req.max_new_tokens or int(first) == self.eos:
+            self._remember(req, t_sid, d_sid)
+            return req.generated, SpecStats(prefill_s=time.perf_counter() - now)
+
+        return self._decode(req, draft_req, t_sid, d_sid, now, keep_resident=True)
+
+    def release(self) -> None:
+        """Free the resident sequences. Safe to call when nothing is resident."""
+        res, self._resident = self._resident, None
+        if res is None:
+            return
+        for eng, sid in ((self.target, res["t_sid"]), (self.draft, res["d_sid"])):
+            eng._active.pop(sid, None)
+            if sid in eng.cache.seq_lens:
+                eng.cache.free_sequence(sid)
+            eng._generated.pop(sid, None)
+
+    def _remember(self, req: LlamaRequest, t_sid: int, d_sid: int) -> None:
+        """Record what the caches now hold, for the next turn to match against."""
+        # The reusable length is what *both* caches hold. They can differ by a
+        # token: the draft's bonus-sync step and the target's verify write on
+        # different schedules, and rolling back past either one's contents
+        # would reuse KV that was never written.
+        self._resident = {
+            "t_sid": t_sid,
+            "d_sid": d_sid,
+            "tokens": list(req.prompt_ids) + list(req.generated),
+            "cached": min(self.target.cache.seq_lens.get(t_sid, 0),
+                          self.draft.cache.seq_lens.get(d_sid, 0)),
+        }
+
     def _n_draft_for(self, context_len: int) -> int:
         """Draft tokens to speculate at this context length."""
         if callable(self.n_draft):
@@ -113,7 +207,8 @@ class SpeculativePagedEngine:
     # Internal: one request
     # ------------------------------------------------------------------
 
-    def _generate_one(self, req: LlamaRequest) -> tuple[list[int], SpecStats]:
+    def _generate_one(self, req: LlamaRequest,
+                      keep_resident: bool = False) -> tuple[list[int], SpecStats]:
         target, draft = self.target, self.draft
         now = time.perf_counter()
 
@@ -143,6 +238,18 @@ class SpeculativePagedEngine:
         # override so both caches are in the same state before the spec loop.
         first_tok_tensor = target._active[t_sid][1]
         draft._active[d_sid] = (draft_req, first_tok_tensor.to(draft.device))
+
+        return self._decode(req, draft_req, t_sid, d_sid, now, keep_resident)
+
+    def _decode(self, req: LlamaRequest, draft_req: LlamaRequest,
+                t_sid: int, d_sid: int, now: float,
+                keep_resident: bool) -> tuple[list[int], SpecStats]:
+        """The speculative loop, from a prefilled pair of caches to completion.
+
+        Split out of ``_generate_one`` so cross-turn prefix reuse can reach it
+        after an incremental prefill instead of a full one.
+        """
+        target, draft = self.target, self.draft
 
         # Prefill (both models) is done; everything after this is decode.
         # Separating them matters: a long prompt with a short answer makes
@@ -278,14 +385,19 @@ class SpeculativePagedEngine:
                 break
 
         # ── Cleanup ─────────────────────────────────────────────────────
-        target._active.pop(t_sid, None)
-        target.cache.free_sequence(t_sid)
-        target._generated.pop(t_sid, None)
-        if d_sid in draft._active:
-            draft._active.pop(d_sid)
-        if d_sid in draft.cache.seq_lens:
-            draft.cache.free_sequence(d_sid)
-        draft._generated.pop(d_sid, None)
+        if keep_resident:
+            # Leave both caches populated so the next turn can roll back to the
+            # shared prefix instead of re-reading it.
+            self._remember(req, t_sid, d_sid)
+        else:
+            target._active.pop(t_sid, None)
+            target.cache.free_sequence(t_sid)
+            target._generated.pop(t_sid, None)
+            if d_sid in draft._active:
+                draft._active.pop(d_sid)
+            if d_sid in draft.cache.seq_lens:
+                draft.cache.free_sequence(d_sid)
+            draft._generated.pop(d_sid, None)
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -302,6 +414,15 @@ class SpeculativePagedEngine:
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
+
+def _common_prefix_len(a: list[int], b: list[int]) -> int:
+    """Length of the longest common prefix of two token sequences."""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
 
 def _get_probs_batch(
     logits: torch.Tensor,

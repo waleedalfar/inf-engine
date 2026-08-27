@@ -316,7 +316,8 @@ class LlamaPagedEngine:
         return done
 
     @torch.no_grad()
-    def _prefill_forward(self, seq_id: int, prompt_ids: list[int]) -> torch.Tensor:
+    def _prefill_forward(self, seq_id: int, prompt_ids: list[int],
+                         base: int = 0) -> torch.Tensor:
         """Run the prompt through the model in chunks; return the last logits.
 
         Activation memory scales with the number of tokens in flight, not with
@@ -329,6 +330,15 @@ class LlamaPagedEngine:
         length. Each chunk attends over everything already cached, which
         llama_attention handles as its offset-causal case, so the result is
         identical to a single pass.
+
+        Args:
+            seq_id:     Sequence to write into.
+            prompt_ids: Tokens to process.
+            base:       Absolute position of ``prompt_ids[0]``. Non-zero when
+                        continuing a sequence whose earlier tokens are already
+                        cached (cross-turn prefix reuse), so RoPE positions and
+                        the attention offset stay aligned with the real
+                        conversation instead of restarting at 0.
 
         Returns:
             Logits for the final position only. Shape: (1, 1, vocab_size).
@@ -345,7 +355,8 @@ class LlamaPagedEngine:
             self.cache.ensure_slots_for(seq_id, L)
             self.cache.begin_step([seq_id])
             ids = torch.tensor([piece], device=self.device)
-            pos = torch.arange(start, start + L, device=self.device)
+            abs_start = base + start
+            pos = torch.arange(abs_start, abs_start + L, device=self.device)
             # In ring mode the gather returns the full [0, start+L) width but the
             # out-of-window blocks have been recycled onto a pinned block (garbage
             # for those positions). A per-row windowed causal mask excludes them,
@@ -354,14 +365,14 @@ class LlamaPagedEngine:
             # no mask and prefill stays offset-causal, unchanged.
             attn_mask = None
             if ring:
-                kv_len = start + L
+                kv_len = abs_start + L
                 q_pos = pos.view(L, 1)
                 j = torch.arange(kv_len, device=self.device).view(1, kv_len)
                 attn_mask = ((j <= q_pos) & ((j >= q_pos - window + 1) | (j < n_sink))).unsqueeze(0)
             # Only the last chunk's final row is ever read; asking for all
             # positions allocates (1, T, vocab) — 9.1 GB at 30k tokens.
             logits = self.model.forward(
-                ids, cache=self.cache, start_pos=start, position_ids=pos,
+                ids, cache=self.cache, start_pos=abs_start, position_ids=pos,
                 n_logits=1, attn_mask=attn_mask,
             )
         return logits
