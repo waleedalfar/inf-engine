@@ -360,12 +360,39 @@ Keep this current. One line per landed change, newest last.
   True decode 26–29 ms/step (91–99 tok/s), above the 55–65 band. Fixed the bench to
   stamp decode-start in-run; added `spec_decode_wall.py`. **Ladder met at 4K/16K/32K.**
   Remaining: 64K (blocked on VRAM — 32K already 83–94 %).
+- 2026-08-23 — main.py: `--fast` exposes the measured-best config; interactive
+  readout now splits decode / prefill / e2e (it had reported e2e only, which read
+  as a 5x regression against CLAUDE.md's decode numbers)
+- 2026-08-23 — Cross-turn prefix reuse (`generate_resident`); interactive turns
+  no longer re-prefill the whole conversation. `_prefill_forward(base=)` carries
+  the absolute position so RoPE stays aligned
 - 2026-08-23 — A4 probe: wired YaRN into the bench (`--n-ctx/--rope-scaling-factor/
   --rope-original-n-ctx`). 64K thrashes at 93 % VRAM; measured the block is the draft's
   unbounded KV (~3.65 GB, never-read past its 4096 window). Fix scoped: ring-buffer
   windowed draft cache. Not yet implemented.
 
 ---
+
+## Working practices that keep the context window usable
+
+This project's sessions are long and measurement-heavy. What actually consumes
+context, in order:
+
+1. **Editing files with shell heredocs instead of the Edit tool.** Rewriting a
+   file out-of-band makes the harness re-dump the *entire file* back into
+   context on its next mention — 200+ lines, repeatedly, for a one-line change.
+   Use Edit/Write so file state stays tracked. This was the single largest
+   waste in the 2026-08-23 session.
+2. **Unfiltered command output.** Always pipe through `tail`/`grep`. Read
+   specific line ranges (`sed -n '300,340p'`) rather than whole files.
+3. **Long commit messages echoed in the tool call.** Keep them to the finding
+   and the number; the reasoning belongs here, once.
+4. **Per-row benchmark notifications.** Write the run to a file and read the
+   table once at the end, unless a row needs acting on immediately.
+
+Keep this file current instead of re-deriving state: it is what a fresh session
+reads first. When context runs short, update the milestone table, the progress
+log, and whichever plan item is in flight — then stop.
 
 ## Commands
 
