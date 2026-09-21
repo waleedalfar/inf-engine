@@ -45,11 +45,23 @@ _QWEN3_SPECIAL_TOKENS: dict[str, int] = {
     "<|video_pad|>": 151_656,
     "<tool_call>": 151_657,
     "</tool_call>": 151_658,
-    "<tool_response>": 151_659,
-    "</tool_response>": 151_660,
-    "<think>": 151_668,
-    "</think>": 151_669,
+    "<|fim_prefix|>": 151_659,
+    "<|fim_middle|>": 151_660,
+    "<|fim_suffix|>": 151_661,
+    "<|fim_pad|>": 151_662,
+    "<|repo_name|>": 151_663,
+    "<|file_sep|>": 151_664,
+    "<tool_response>": 151_665,
+    "</tool_response>": 151_666,
+    "<think>": 151_667,
+    "</think>": 151_668,
 }
+
+# HF marks these `"special": false` in tokenizer_config.json, which means "do not
+# strip on decode" — NOT "not a real added token". They still must be registered
+# with tiktoken or they can be neither encoded nor decoded. Only the ids below
+# are removed by ``decode(skip_special_tokens=True)``.
+_STRIPPABLE_DEFAULT: frozenset[int] = frozenset(range(151_643, 151_657))
 
 
 def _bytes_to_unicode_inverse() -> dict[int, int]:
@@ -97,7 +109,7 @@ class QwenTokenizer:
     def __init__(self, model_dir: str | Path) -> None:
         model_dir = Path(model_dir)
 
-        special_tokens = self._load_special_tokens(model_dir)
+        special_tokens, strippable_ids = self._load_special_tokens(model_dir)
 
         tiktoken_file = model_dir / "qwen.tiktoken"
         json_file = model_dir / "tokenizer.json"
@@ -114,7 +126,10 @@ class QwenTokenizer:
             )
 
         self._special_tokens: dict[str, int] = special_tokens
-        self._special_token_ids: frozenset[int] = frozenset(special_tokens.values())
+        # Only the control tokens are stripped on decode. `<think>` and
+        # `<tool_response>` are added tokens the caller legitimately wants to see
+        # — the agent loop parses them out of the visible text itself.
+        self._special_token_ids: frozenset[int] = strippable_ids
 
     # ------------------------------------------------------------------
     # Public API
@@ -185,17 +200,40 @@ class QwenTokenizer:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _load_special_tokens(model_dir: Path) -> dict[str, int]:
-        """Build special-token dict from tokenizer_config.json, falling back to defaults."""
+    def _load_special_tokens(model_dir: Path) -> tuple[dict[str, int], frozenset[int]]:
+        """Read ``added_tokens_decoder``, falling back to the published defaults.
+
+        Returns ``(all_added_tokens, strippable_ids)``.
+
+        **Every** added token is registered, not just those flagged
+        ``"special": true``. That flag is HF's "strip me on decode" marker; it
+        does not mean the token is absent from the vocabulary. Filtering on it
+        used to leave ``<think>``, ``</think>``, ``<tool_response>`` and
+        ``</tool_response>`` on stale hardcoded ids — so ``<think>`` encoded as
+        ``</think>``, tool results were wrapped in ``<|fim_prefix|>`` instead of
+        ``<tool_response>``, and a real ``<think>`` (151667) emitted under
+        ``--thinking`` crashed decode as an unknown id.
+        """
         result = dict(_QWEN3_SPECIAL_TOKENS)
+        strippable = set(_STRIPPABLE_DEFAULT)
         config_path = model_dir / "tokenizer_config.json"
         if config_path.is_file():
             with open(config_path) as f:
                 config = json.load(f)
-            for id_str, info in config.get("added_tokens_decoder", {}).items():
-                if info.get("special", False):
-                    result[info["content"]] = int(id_str)
-        return result
+            added = config.get("added_tokens_decoder", {})
+            claimed = {int(i): info["content"] for i, info in added.items()}
+            # Drop any default the checkpoint has reassigned to a different name,
+            # or tiktoken would be handed two names for one id.
+            for name, tid in list(result.items()):
+                if claimed.get(tid, name) != name:
+                    del result[name]
+            for tid, name in claimed.items():
+                result[name] = tid
+                if added[str(tid)].get("special", False):
+                    strippable.add(tid)
+                else:
+                    strippable.discard(tid)
+        return result, frozenset(strippable)
 
     @staticmethod
     def _load_tiktoken_bpe(path: Path) -> dict[bytes, int]:

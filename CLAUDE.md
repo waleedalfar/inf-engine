@@ -581,6 +581,13 @@ Keep this current. One line per landed change, newest last.
   prefix-reuse coverage. **32K 3-slice peak VRAM flat 10.5–11.3 GB instead of
   climbing 12.0→16.1; slice 2 prefill 121 s → 26 s, 79.6 → 33.3 ms/step.**
   Acceptance neutral, decode ms/step unchanged within noise on healthy slices.
+- 2026-08-27 — Fixed Qwen3 added-token ids. `_load_special_tokens` honoured only
+  entries flagged `"special": true`, but Qwen3 marks `<think>`, `</think>`,
+  `<tool_response>` and `</tool_response>` `false`, so four ids stayed on a stale
+  hardcoded table: `<think>` encoded as `</think>`, tool results were wrapped in
+  `<|fim_prefix|>`/`<|fim_middle|>`, and `--thinking` crashed on decode of a real
+  `<think>` (151667). Benchmarks are unaffected (they never build a chat prompt);
+  **every agentic run before this was feeding the model malformed tool results.**
 - 2026-08-27 — 64K formally dropped from the milestone by the project owner on VRAM
   evidence (see A4). Ladder is now 4K/16K/32K, all met; Phase A done.
 
