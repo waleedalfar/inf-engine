@@ -2,8 +2,12 @@
 
 ## START HERE — state as of 2026-08-27
 
-**The ladder is met and Phase A is done.** 4K, 16K and 32K all pass, and 32K is
-now VRAM-robust rather than VRAM-tight. **64K was formally dropped from the
+**The ladder is met on the `continuation` workload; 16K is unmet on the
+realistic one.** `--workload chat` (added 2026-08-27) measures the task the app
+actually runs and puts 16K at 78.3–92.6 tok/s against its 80–90 band — two of
+three slices below. 4K and 32K pass both ways. See the workload table below;
+**closing 16K on the chat workload is the open Phase A item.** 32K is now
+VRAM-robust rather than VRAM-tight. **64K was formally dropped from the
 milestone on 2026-08-27** by the project owner, on the evidence in *A4* — it is
 not a pending task and should not be reinstated without new information.
 
@@ -82,6 +86,26 @@ monotone ms/step curve puts it near 32–35 ms/step, comfortably inside its old
 40–42 tok/s band), and the best case after every available VRAM lever was ~83 %
 of the card — exactly the tightness 32K used to misbehave at. Dropped on
 evidence, not on difficulty.
+
+**The table above is the `continuation` workload, and it overstates real use.**
+The bench fed the model a raw source slice and asked it to continue the file —
+near-copying, because every identifier and idiom is already in context. The app
+does not do that: `engine/paged_session.py:190` builds prompts with
+`format_messages`, and the model composes an *answer*. `--workload chat`
+(2026-08-27) measures that instead, same corpus tokens, same prompt length, only
+the framing differs. Measured in one session, 3 slices, ring on:
+
+| ctx | band | continuation tok/s | accept | **chat tok/s** | **accept** |
+|---|---|---|---|---|---|
+| 4K  | 90–120 | 131.2 / 146.9 / 141.3 | 78.7–86.3 % | **102.4 / 93.9 / 97.3** | 59.5–65.2 % |
+| 16K | 80–90  | 130.6 / 145.4 / 141.3 | 83.1–95.1 % | **92.6 / 78.5 / 78.3** | 55.9–66.1 % |
+| 32K | 55–65  | 90.4 / 103.8 / 108.0  | 66.7–86.2 % | **65.4 / 86.4 / 74.1** | 50.5–62.2 % |
+
+Chat acceptance (50.5–66.1 %) matches what the agent loop actually delivers
+(52–76 % measured interactively), which is the check that says this workload is
+the honest one. **16K FAILS its band on the realistic workload** — 78.3 and 78.5
+on two of three slices against a floor of 80. Marginal, but recorded as unmet;
+the band is not moved to accommodate it. 4K and 32K pass.
 
 Best config: INT8 draft + target KV, split-K INT4 matmul, **draft attention
 window 4096 with 4 sink tokens**, n_draft=4.
@@ -493,6 +517,25 @@ change to the draft — its KV format, its window, its weights — must be gated
 the identity gate with an acceptance number or you have checked nothing about
 whether the change was worth making.
 
+**`ms/step` is not acceptance-independent — SUSPECTED, not yet proven
+(2026-08-27).** The standing advice above is to compare ms/step across a code
+change because tok/s moves with acceptance. That advice is weaker than it looks.
+Within the `continuation` workload, ms/step rises monotonically with acceptance
+at every length: 24.60 @ 78.7 % → 25.21 @ 86.3 % (4K); 27.35 @ 83.1 % → 31.25 @
+95.1 % (16K); 28.75 @ 66.7 % → 34.30 @ 86.2 % (32K). Mechanism: 200 tokens at
+high acceptance is ~54 steps, at low acceptance ~96, so any fixed cost inside the
+measured decode window is divided across very different step counts. Solving for
+that cost gives ~139 / 325 / 745 ms at 4K / 16K / 32K — growing with context,
+which points at a first-step cost (first graph replay, first full-KV attention)
+landing after `decode_start` is stamped.
+
+**That is a three-point fit to an assumed model, not a measurement — do not cite
+the 745 ms as a result.** Settle it by discarding the first decode step from the
+timing, or by emitting `decode_s` and `n_steps` so the relationship can be
+checked directly. Until then, a ms/step comparison across a change that also
+moved acceptance is confounded. tok/s is unaffected (measured from wall time and
+token count directly).
+
 **Cold-cache microbenchmarks only.** Re-timing one weight tensor reads L2 (64 MB
 on GB203), not HBM. A hot sweep predicted 1.16× and delivered ~0 in-graph.
 
@@ -590,6 +633,12 @@ Keep this current. One line per landed change, newest last.
   **every agentic run before this was feeding the model malformed tool results.**
 - 2026-08-27 — 64K formally dropped from the milestone by the project owner on VRAM
   evidence (see A4). Ladder is now 4K/16K/32K, all met; Phase A done.
+- 2026-08-27 — `--workload chat` in `ctx_scaling_bench`: wraps the same corpus
+  tokens in `format_messages` so the model answers a question instead of
+  continuing a file — the task the app actually runs. No bench had ever used the
+  chat template. tok/s falls 26–42 % and acceptance lands at 50.5–66.1 %, matching
+  the agent loop. **16K falls below its band (78.3/78.5 vs floor 80) and is
+  recorded unmet.** Default workload unchanged, so historical numbers stand.
 
 ---
 

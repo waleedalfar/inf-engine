@@ -28,6 +28,8 @@ from pathlib import Path
 
 import torch
 
+from engine.chat import format_messages
+
 # Committed targets from CLAUDE.md, for at-a-glance comparison.
 TARGETS = {4096: (90, 120), 16384: (80, 90), 32768: (55, 65), 65536: (40, 42)}
 
@@ -105,6 +107,53 @@ def _corpus_ids(tokenizer, need: int) -> tuple[list[int], str]:
     return ids, digest
 
 
+# Fixed so runs stay comparable; hashed into the fingerprint so a change to it
+# cannot silently invalidate a comparison. It has to reliably elicit more than
+# --max-new-tokens of answer, or the tail of every generation is post-EOS
+# rambling rather than the workload we mean to measure (see _first_eos).
+_CHAT_QUESTION = (
+    "Read the code above carefully. Explain in detail what it does, walk through "
+    "its main components and how they fit together, and describe any bugs, "
+    "edge cases, or design weaknesses you notice. Be thorough and specific."
+)
+
+
+def _chat_prompt_ids(tokenizer, ctx_ids: list[int], plen: int) -> list[int]:
+    """Wrap ``ctx_ids`` in the chat template the app actually uses, at exactly ``plen``.
+
+    ``engine/paged_session.py`` builds every real prompt with ``format_messages``;
+    no benchmark did, which is the whole reason bench tok/s overstated reality.
+    Continuing a source file is near-copying — the draft is predicting text whose
+    identifiers and idiom are already established in-context. Answering a question
+    *about* that file is composition, and that is what the app does.
+
+    Assembled in token space rather than by decoding ``ctx_ids`` to text and
+    re-encoding: BPE round-trips are not length-stable, so re-encoding would make
+    ``plen`` approximate and the corpus slice no longer the same tokens the
+    continuation workload uses. Here the KV content is identical between the two
+    workloads and only the framing differs, which is what makes them comparable.
+    """
+    rendered = format_messages(
+        [{"role": "user", "content": "\x00"}], None, enable_thinking=False
+    )
+    head_text, tail_text = rendered.split("\x00", 1)
+    head = tokenizer.encode(head_text, add_special_tokens=True)
+    tail = tokenizer.encode("\n\n" + _CHAT_QUESTION + tail_text, add_special_tokens=True)
+
+    k = plen - len(head) - len(tail)
+    if k <= 0:
+        raise SystemExit(
+            f"--workload chat needs plen > {len(head) + len(tail)} tokens of "
+            f"template overhead; got plen={plen}"
+        )
+    return head + ctx_ids[:k] + tail
+
+
+def _first_eos(ids: list[int], eos: int) -> int | None:
+    """Index of the first ``<|im_end|>``, or None. See the post-EOS warning."""
+    return ids.index(eos) if eos in ids else None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model-dir", required=True)
@@ -134,6 +183,18 @@ def main() -> None:
                          "the lever for 64K, where the draft's INT8 KV is ~3.95 GB "
                          "against the target's 5.0 and pushes the card past its "
                          "16.3 GB.")
+    ap.add_argument("--workload", choices=("continuation", "chat"),
+                    default="continuation",
+                    help="What the model is asked to GENERATE. 'continuation' "
+                         "(default) feeds a raw corpus slice and measures "
+                         "continuing a source file — the most predictable task a "
+                         "code-trained draft can get, which is why it reports "
+                         "81-96%% acceptance. 'chat' wraps the same corpus tokens "
+                         "in the template engine/paged_session.py uses and asks a "
+                         "question about them, so the model composes an answer "
+                         "like it does in the app. ms/step is the engine metric "
+                         "and should barely move between the two; tok/s is a "
+                         "workload metric and will.")
     ap.add_argument("--draft-ring", action="store_true",
                     help="Bound the draft's KV *pool* to its window instead of "
                          "the full context (requires --draft-window). The draft "
@@ -207,9 +268,15 @@ def main() -> None:
     all_ids, corpus_digest = _corpus_ids(tokenizer, max(args.lengths) + 16)
     greedy = SamplingConfig(mode=SamplingMode.GREEDY)
 
-    print(f"\ncorpus {corpus_digest} (acceptance is comparable across runs only "
+    # The workload is part of the fingerprint, not just the corpus: acceptance is
+    # only comparable when the generation *task* matches too.
+    fingerprint = corpus_digest
+    if args.workload != "continuation":
+        qh = hashlib.sha256(_CHAT_QUESTION.encode()).hexdigest()[:6]
+        fingerprint = f"{corpus_digest}/{args.workload}:{qh}"
+    print(f"\ncorpus {fingerprint} (acceptance is comparable across runs only "
           f"when this matches)")
-    print(f"generating {N} tokens per point, "
+    print(f"generating {N} tokens per point, workload={args.workload}, "
           f"draft KV={d_kv_name}, target KV={'int8' if t_kv else 'bf16'}, "
           f"draft window={args.draft_window or 'full'}"
           f"{' (ring pool)' if args.draft_ring else ''}")
@@ -229,7 +296,11 @@ def main() -> None:
         # Evenly spaced offsets so slices sample different material.
         span = max(len(all_ids) - plen - 1, 1)
         offset = (span // max(args.slices, 1)) * slice_i
-        ids = all_ids[offset:offset + plen]
+        if args.workload == "chat":
+            ids = _chat_prompt_ids(tokenizer, all_ids[offset:offset + plen], plen)
+        else:
+            ids = all_ids[offset:offset + plen]
+        assert len(ids) == plen, f"prompt is {len(ids)} tokens, expected {plen}"
         n_blocks = (plen + N + n_draft + 64) // 16 + 64
 
         def build():
@@ -291,10 +362,24 @@ def main() -> None:
         if peak_gb > 0.80 * total_gb:
             print(f"{'':>8}  ^ peak is {peak_gb / total_gb:.0%} of the {total_gb:.1f} GB card — "
                   "timings past ~80% are allocator thrash, not engine cost")
+        if args.workload == "chat":
+            # eos_token=None keeps every row the same length, so the model does
+            # not stop at the end of its answer — it emits <|im_end|> and then
+            # rambles. That tail is degenerate continuation and its acceptance is
+            # meaningless, which would re-inflate tok/s exactly the way the
+            # continuation workload does. Catch it rather than trust it.
+            eos_at = _first_eos(res[1], tokenizer.im_end_id)
+            if eos_at is not None:
+                print(f"{'':>8}  ^ answer ended at token {eos_at} of {n} — the "
+                      f"remaining {n - eos_at} are post-EOS rambling, not the "
+                      "workload. Lower --max-new-tokens or use a question that "
+                      "elicits a longer answer; this row's tok/s is not usable")
         if st.acceptance_rate > 0.95:
-            print(f"{'':>8}  ^ acceptance {st.acceptance_rate:.0%} is implausibly high — the "
-                  "prompt is probably repeating corpus the draft has already seen. "
-                  "tok/s is inflated; compare ms/step instead")
+            print(f"{'':>8}  ^ acceptance {st.acceptance_rate:.0%} is implausibly high. "
+                  "The corpus does not repeat (152k tokens, ~16k used) — this is "
+                  "content the draft finds near-perfectly predictable, e.g. "
+                  "continuing this repo's own Python. tok/s is inflated for any "
+                  "realistic workload; compare ms/step, or use --workload chat")
 
         del eng
         torch.cuda.empty_cache()
